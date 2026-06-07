@@ -205,7 +205,7 @@ async def admin_menu_settings(message: Message, session: AsyncSession, state: FS
         [InlineKeyboardButton(text="🏦 全站收款主地址配置", callback_data="admin_set_master_wallet")],
         [InlineKeyboardButton(text="🌐 Tron API 节点池管理", callback_data="admin_set_tron_api")],
         [InlineKeyboardButton(text="👋 全局默认欢迎语设置", callback_data="admin_set_welcome_msg")],
-        [InlineKeyboardButton(text="👁 切换客服显示状态", callback_data="admin_toggle_cs_display")]
+        [InlineKeyboardButton(text="👁 切换客服显示状态", callback_data="admin_toggle_cs_display")],
         [InlineKeyboardButton(text="🔔 预警余额配置", callback_data="admin_set_alert_trigger")]
     ])
     
