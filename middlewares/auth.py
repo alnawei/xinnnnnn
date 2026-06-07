@@ -1,14 +1,17 @@
+# middlewares/auth.py
+
 from typing import Callable, Dict, Any, Awaitable
 from datetime import datetime
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from models import AsyncSessionLocal, Tenant, User, SystemConfig
 
 class AuthMiddleware(BaseMiddleware):
     """
-    全局身份鉴权与核级风控拦截中间件 (强类型隔离版)
+    全局身份鉴权与核级风控拦截中间件 (强类型隔离与高并发防撞版)
     """
     async def __call__(
         self,
@@ -27,7 +30,7 @@ class AuthMiddleware(BaseMiddleware):
         current_user = None
 
         async with AsyncSessionLocal() as session:
-            # 🛡️ 防御 3：实时动态读取超管ID，并强制转换为去空格字符串，彻底杜绝类型隐式转换造成的降权
+            # 🛡️ 防御 1：实时动态读取超管ID，并强制转换为去空格字符串，彻底杜绝类型隐式转换造成的降权
             sys_config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
             super_admin_id_str = str(sys_config.super_admin_tg_id).strip() if sys_config and sys_config.super_admin_tg_id else None
             
@@ -43,17 +46,26 @@ class AuthMiddleware(BaseMiddleware):
             if not is_master_bot:
                 # ------ 场景 A：当前是【租户克隆机器人】 ------
 
-                # [核级生命周期拦截]
+                # 🛡️ [核级生命周期拦截]
                 now = datetime.utcnow()
                 if bot_tenant_owner.expire_time < now:
                     if isinstance(event, Message):
-                        await event.answer("⚠️ <b>店铺打烊通知</b>\n\n抱歉，本机器人服务授权已到期，各项功能已全面暂停。\n请联系店长完成续费后恢复使用。", parse_mode="HTML")
+                        await event.answer(
+                            "⚠️ <b>店铺打烊通知</b>\n\n"
+                            "抱歉，本机器人服务授权已到期，各项功能已全面暂停。\n"
+                            "请联系店长完成续费后恢复使用。", 
+                            parse_mode="HTML"
+                        )
                     return 
 
-                # [核级封禁拦截]
+                # 🛡️ [核级封禁拦截]
                 if getattr(bot_tenant_owner, "is_banned", False):
                     if isinstance(event, Message):
-                        await event.answer("⚠️ <b>服务暂停通知</b>\n\n抱歉，本机器人因违反平台风控规则已被强制关停。", parse_mode="HTML")
+                        await event.answer(
+                            "⚠️ <b>服务暂停通知</b>\n\n"
+                            "抱歉，本机器人因违反平台风控规则已被强制关停。", 
+                            parse_mode="HTML"
+                        )
                     return 
 
                 current_tenant = bot_tenant_owner
@@ -66,15 +78,25 @@ class AuthMiddleware(BaseMiddleware):
                 current_user = await session.scalar(user_stmt)
                 
                 if not current_user:
-                    current_user = User(
-                        tenant_id=bot_tenant_owner.id,
-                        tg_user_id=user_id,
-                        tg_first_name=event.from_user.first_name[:120] if event.from_user.first_name else "Unknown"
-                    )
-                    session.add(current_user)
-                    await session.commit()
+                    try:
+                        current_user = User(
+                            tenant_id=bot_tenant_owner.id,
+                            tg_user_id=user_id,
+                            tg_first_name=event.from_user.first_name[:120] if event.from_user.first_name else "Unknown",
+                            balance=0,
+                            total_orders=0,
+                            total_spent_trx=0
+                        )
+                        session.add(current_user)
+                        await session.commit()
+                    except IntegrityError:
+                        # 🛡️ 防御 2 (并发防撞击气囊)：捕获唯一键冲突
+                        # 说明在极短的毫秒内，其他并发的协程已经帮该用户建好档案了
+                        await session.rollback()
+                        # 安全回滚后，直接再查一次，平滑拿到最新数据，绝不崩溃！
+                        current_user = await session.scalar(user_stmt)
                     
-                # 🛡️ 严格身份鉴定 (强类型字符串比对)
+                # 🛡️ 防御 3：严格身份鉴定 (强类型字符串比对)
                 if super_admin_id_str and user_id_str == super_admin_id_str:
                     role = "admin"
                 elif user_id_str == str(bot_tenant_owner.owner_tg_id).strip():
