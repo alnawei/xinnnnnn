@@ -521,7 +521,9 @@ async def process_bot_token(message: Message, state: FSMContext, session: AsyncS
         return await message.answer("⚠️ 您当前已经是代理，无需重复激活！", reply_markup=build_tenant_keyboard(True))
 
     try:
-        expire_date = datetime.datetime.utcnow() + datetime.timedelta(days=30)
+        # 👇 【修改处 1】：删除了多余的 "datetime." 前缀，直接使用 datetime.utcnow() 和 timedelta()
+        expire_date = datetime.utcnow() + timedelta(days=30)
+        
         new_tenant = Tenant(
             owner_tg_id=user_id,
             bot_token=token,
@@ -535,7 +537,8 @@ async def process_bot_token(message: Message, state: FSMContext, session: AsyncS
         stmt = update(ActivationCode).where(ActivationCode.code == valid_code).values(
             is_used=True,
             used_by_tg_id=str(user_id),
-            used_at=datetime.datetime.utcnow()
+            # 👇 【修改处 2】：删除了多余的 "datetime." 前缀
+            used_at=datetime.utcnow()
         )
         await session.execute(stmt)
         await session.commit()
