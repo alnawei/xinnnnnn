@@ -696,106 +696,109 @@ async def toggle_cs_display(call: CallbackQuery, session: AsyncSession, state: F
 # =====================================================================
 # 模块：超管全局预警余额阈值动态配置
 # =====================================================================
+# =====================================================================
+# 模块：超管全局预警余额阈值动态配置 (仪表盘模式)
+# =====================================================================
 
-# 1. 点击按钮触发：进入超管余额预警设置
 @admin_router.callback_query(F.data == "admin_set_alert_trigger")
-async def cb_start_alert_setup(call: CallbackQuery, state: FSMContext):
-    """点击预警余额通知按钮，开始配置"""
-    await call.message.edit_text(
+async def cb_alert_dashboard(call: CallbackQuery, session: AsyncSession, state: FSMContext):
+    """【仪表盘主页】展示当前预警阈值并提供分支选项"""
+    await state.clear()
+    config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
+    config = (await session.execute(config_stmt)).scalar_one_or_none()
+    
+    netts_alert = getattr(config, 'netts_alert_threshold', 50.0) if config else 50.0
+    tenant_alert = getattr(config, 'tenant_alert_threshold', 15.0) if config else 15.0
+    
+    text = (
         "⚙️ <b>【全局设置 - 预警余额通知配置】</b>\n\n"
-        "第一步：\n"
-        "✏️ <b>请输入【超管 Netts 余额预警值】（TRX 数量，例如 50）：</b>\n"
+        f"1️⃣ <b>当前超管 Netts 余额预警线</b>：<code>{netts_alert}</code> TRX\n"
+        f"2️⃣ <b>当前特价租户本金预警线</b>：<code>{tenant_alert}</code> TRX\n\n"
+        "👇 <i>请选择您需要单独修改的预警项目：</i>"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ 修改 Netts 预警阈值", callback_data="admin_edit_netts_alert")],
+        [InlineKeyboardButton(text="✏️ 修改租户本金预警阈值", callback_data="admin_edit_tenant_alert")],
+        [InlineKeyboardButton(text="🔙 返回全局设置", callback_data="admin_menu_settings_back")]
+    ])
+    
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@admin_router.callback_query(F.data == "admin_edit_netts_alert")
+async def cb_edit_netts_alert(call: CallbackQuery, state: FSMContext):
+    """触发修改 Netts 预警状态机"""
+    await call.message.edit_text(
+        "✏️ <b>请输入全新的【超管 Netts 余额预警值】（TRX 数量，例如 50）：</b>\n"
         "<i>当您的 Netts 上游进货池余额低于此数值时，系统将向您报警。</i>\n\n"
-        "(发送 /cancel 可退出配置)",
-        parse_mode="HTML"
+        "(发送 /cancel 可退出配置)", parse_mode="HTML"
     )
     await state.set_state(AdminAlertSetupFSM.waiting_for_admin_limit)
     await call.answer()
 
-# 2. 接收并处理超管预警值，引导进入租户预警设置
 @admin_router.message(AdminAlertSetupFSM.waiting_for_admin_limit)
-async def process_admin_alert_limit(message: Message, state: FSMContext):
-    """处理超管预警线输入"""
-    if message.text.strip() == '/cancel':
+async def process_netts_alert(message: Message, state: FSMContext, session: AsyncSession):
+    """处理并保存 Netts 预警线"""
+    if not message.text:
+        return await message.answer("❌ 格式错误！请输入有效的纯数字文本。")
+    if message.text.strip().lower() == '/cancel':
         await state.clear()
-        await message.answer("✅ 已取消预警配置。")
-        return
+        return await message.answer("✅ 已取消预警配置。")
 
-    input_val = message.text.strip()
     try:
-        admin_limit = float(input_val)
-        if admin_limit < 0:
-            raise ValueError
+        val = float(message.text.strip())
+        if val < 0: raise ValueError
     except ValueError:
-        await message.answer("❌ 输入错误！请输入一个有效的正数（如 50 或 100.5）：")
-        return
+        return await message.answer("❌ 输入错误！请输入一个有效的正数（如 50 或 100.5）：")
 
-    # 暂存超管数据到内存状态机中
-    await state.update_data(admin_limit=admin_limit)
-    
-    # 引导进入第二步
-    await message.answer(
-        "⚙️ <b>【全局设置 - 预警余额通知配置】</b>\n\n"
-        "第二步：\n"
-        "✏️ <b>请输入【特价租户余额预警值】（TRX 数量，例如 15）：</b>\n"
-        "<i>当特价子商铺的【充值本金】低于此数值时，系统将自动向租户发送充值催收通知。</i>\n\n"
-        "(发送 /cancel 可退出配置)",
-        parse_mode="HTML"
-    )
-    await state.set_state(AdminAlertSetupFSM.waiting_for_tenant_limit)
-
-# 3. 接收租户预警值，并永久写入数据库动态生效
-@admin_router.message(AdminAlertSetupFSM.waiting_for_tenant_limit)
-async def process_tenant_alert_limit(message: Message, state: FSMContext, session: AsyncSession):
-    """处理租户预警线输入并最终保存"""
-    if message.text.strip() == '/cancel':
+    try:
+        config = (await session.execute(select(SystemConfig).where(SystemConfig.id == 1))).scalar_one_or_none()
+        if config:
+            config.netts_alert_threshold = Decimal(str(val))
+            await session.commit()
+            await message.answer(f"✅ <b>修改成功！</b> Netts 预警阈值已更新为 <code>{val}</code> TRX。", parse_mode="HTML")
         await state.clear()
-        await message.answer("✅ 已取消预警配置。")
-        return
-
-    input_val = message.text.strip()
-    try:
-        tenant_limit = float(input_val)
-        if tenant_limit < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ 输入错误！请输入一个有效的正数（如 15 或 20.5）：")
-        return
-
-    # 从内存中取出第一步暂存的超管数据
-    data = await state.get_data()
-    admin_limit = data.get("admin_limit")
-    await state.clear()
-
-    # 事务持久化入库
-    try:
-        config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
-        config = (await session.execute(config_stmt)).scalar_one_or_none()
-        
-        if not config:
-            await message.answer("❌ 数据库中未初始化 SystemConfig(id=1) 记录，保存失败！")
-            return
-
-        # 更新阈值字段 (请确保 models.py 中已存在这两个字段)
-        config.netts_alert_threshold = Decimal(str(admin_limit))
-        config.tenant_alert_threshold = Decimal(str(tenant_limit))
-        
-        await session.commit()
-
-        success_text = (
-            "🚀 <b>预警阈值全新配置成功！已经实时生效！</b>\n\n"
-            f"1️⃣ <b>超管 Netts 余额预警线</b>：<code>{admin_limit}</code> TRX\n"
-            f"2️⃣ <b>特价租户本金预警线</b>：<code>{tenant_limit}</code> TRX\n\n"
-            "<i>💡 提示：后台监控雷达引擎在下次巡航扫描时，将自动切换至此全新阈值，无需重启服务器。</i>"
-        )
-        await message.answer(success_text, parse_mode="HTML")
-        
-        # 无缝返回全局设置主菜单
-        await admin_menu_settings(message, session, state)
-
     except Exception as e:
         await session.rollback()
-        await message.answer(f"❌ 数据库保存失败，资金与配置安全回滚：{str(e)}")
+        await message.answer(f"❌ 数据库保存失败：{str(e)}")
+
+@admin_router.callback_query(F.data == "admin_edit_tenant_alert")
+async def cb_edit_tenant_alert(call: CallbackQuery, state: FSMContext):
+    """触发修改租户预警状态机"""
+    await call.message.edit_text(
+        "✏️ <b>请输入全新的【特价租户本金预警值】（TRX 数量，例如 15）：</b>\n"
+        "<i>当特价子商铺的【充值本金】低于此数值时，系统将自动向租户发送催收通知。</i>\n\n"
+        "(发送 /cancel 可退出配置)", parse_mode="HTML"
+    )
+    await state.set_state(AdminAlertSetupFSM.waiting_for_tenant_limit)
+    await call.answer()
+
+@admin_router.message(AdminAlertSetupFSM.waiting_for_tenant_limit)
+async def process_tenant_alert(message: Message, state: FSMContext, session: AsyncSession):
+    """处理并保存租户预警线"""
+    if not message.text:
+        return await message.answer("❌ 格式错误！请输入有效的纯数字文本。")
+    if message.text.strip().lower() == '/cancel':
+        await state.clear()
+        return await message.answer("✅ 已取消预警配置。")
+
+    try:
+        val = float(message.text.strip())
+        if val < 0: raise ValueError
+    except ValueError:
+        return await message.answer("❌ 输入错误！请输入一个有效的正数（如 15 或 20.5）：")
+
+    try:
+        config = (await session.execute(select(SystemConfig).where(SystemConfig.id == 1))).scalar_one_or_none()
+        if config:
+            config.tenant_alert_threshold = Decimal(str(val))
+            await session.commit()
+            await message.answer(f"✅ <b>修改成功！</b> 特价租户预警阈值已更新为 <code>{val}</code> TRX。", parse_mode="HTML")
+        await state.clear()
+    except Exception as e:
+        await session.rollback()
+        await message.answer(f"❌ 数据库保存失败：{str(e)}")
 
 @admin_router.callback_query(F.data == "admin_set_markup_65k")
 async def trigger_set_markup_65k(call: CallbackQuery, state: FSMContext):
