@@ -1,5 +1,7 @@
 # routers/tenant.py
 import datetime
+import random
+import json
 from decimal import Decimal
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -13,9 +15,9 @@ from filters.role import RoleFilter
 from keyboards.reply import build_tenant_keyboard
 from bot_manager import bot_manager
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from models import Tenant, WithdrawOrder, SystemConfig, ActivationCode, EnergyOrder, SaaSOrder
-import json
 from datetime import datetime, timedelta
+from models import Tenant, WithdrawOrder, SystemConfig, ActivationCode, EnergyOrder, SaaSOrder, MicroDepositOrder, User
+
 
 # ==================== 0. 工具函数 ====================
 def format_amount(amount):
@@ -42,6 +44,9 @@ async def tenant_start(message: Message, current_tenant: Tenant, session: AsyncS
     )
 
 class TenantWithdrawFSM(StatesGroup):
+    waiting_for_amount = State()
+# 👇 新增：代理本金充值状态机
+class TenantDepositFSM(StatesGroup):
     waiting_for_amount = State()
 
 class TenantSpecialFSM(StatesGroup):
@@ -88,41 +93,142 @@ async def tenant_dashboard(message: Message, current_tenant: Tenant, session: As
 # 代理/租户本金充值流程 (仅限拥有特权的代理可用)
 # =========================================================
 @tenant_router.callback_query(F.data == "tenant_deposit_trx")
-async def trigger_tenant_deposit(call: CallbackQuery, current_tenant: Tenant, session: AsyncSession):
-    await call.answer()  # 必须先响应，消除转圈加载
+async def trigger_tenant_deposit(call: CallbackQuery, current_tenant: Tenant, session: AsyncSession, state: FSMContext):
+    await call.answer()  # 消除转圈
     
-    # 再次进行防越权校验 (双重保险)
+    # 防越权校验
     sys_config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
     is_special_enabled = getattr(sys_config, "is_special_energy_global_enabled", True)
     
     if not (is_special_enabled and current_tenant.has_special_energy_right):
         return await call.message.answer("⚠️ 您当前未开通特价能量功能，无需充值本金。")
 
-    master_wallet = getattr(sys_config, "master_receive_address", "未配置全站收款地址")
-    
+    # 第一步：引导输入金额并进入 FSM 等待状态
     text = (
         "💎 <b>代理本金充值通道 (TRX 直充)</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "由于您开通了特价能量直发特权，系统在自动派单时将从您的【充值本金】池中扣除系统底价成本。\n\n"
-        "👉 <b>请向以下官方收款地址转账 TRX：</b>\n\n"
-        f"<code>{master_wallet}</code>\n"
-        "👆👆👆👆👆👆👆👆👆👆\n"
-        "<i>(点击上方地址即可一键复制)</i>\n\n"
-        "⚠️ <b>重要说明：</b>\n"
-        "1. 代理后台的资金池采用动态匹配，不限制转账额度（直接转账任意整数或小数均可）。\n"
-        "2. 请务必使用您用于提现或绑定的私人钱包转账，以便系统追踪溯源。\n"
-        "3. 转账完成后，请截图 TXID 发送给母平台客服为您手工入账。"
+        "✏️ <b>请输入您需要充值的本金金额（必须为整数，建议 50 以上）：</b>\n\n"
+        "<i>系统将为您自动生成专属的尾数防伪订单，发送 /cancel 可取消。</i>"
     )
     
-    # 将当前的个人主页卡片变更为充值引导页，并附带返回主页按钮
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 返回个人中心", callback_data="back_to_tenant_home")]
-    ])
-    
     try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await call.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(TenantDepositFSM.waiting_for_amount)
     except TelegramBadRequest:
         pass
+
+@tenant_router.message(TenantDepositFSM.waiting_for_amount)
+async def process_tenant_deposit_amount(message: Message, current_tenant: Tenant, session: AsyncSession, state: FSMContext):
+    """第二步：处理输入的金额，生成尾数单并弹出标准收银台"""
+    if message.text.strip().lower() == '/cancel':
+        await state.clear()
+        return await message.answer("✅ 已取消本金充值操作。")
+
+    if not message.text.isdigit():
+        return await message.answer("❌ 格式错误！请输入有效的【纯数字整数】金额：")
+
+    base_amount = int(message.text.strip())
+    if base_amount < 10:
+        return await message.answer("❌ 充值金额不可低于 10 TRX，请重新输入：")
+
+    await state.clear()
+    wait_msg = await message.answer("🔄 正在为您生成高精度安全防伪订单，请稍候...")
+
+    try:
+        # 获取系统配置与主收款地址
+        sys_config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
+        master_wallet = getattr(sys_config, "master_receive_address", "未配置")
+
+        # 核心算法：尾数防撞库生成
+        now_time = datetime.utcnow()
+        expire_time = now_time + timedelta(minutes=10)
+        
+        final_amount = None
+        is_three_digits = False
+
+        # === 阶段一：2 位小数尾数排重 (.01 ~ .99) ===
+        for _ in range(40):
+            tail_int = random.randint(1, 99)
+            tail_str = f"0.{tail_int:02d}"
+            test_amount = Decimal(str(base_amount)) + Decimal(tail_str)
+            
+            stmt = select(MicroDepositOrder).where(
+                MicroDepositOrder.expected_amount == test_amount,
+                MicroDepositOrder.status == 'PENDING',
+                MicroDepositOrder.expired_at > now_time
+            )
+            if not (await session.execute(stmt)).scalar_one_or_none():
+                final_amount = test_amount
+                break
+
+        # === 阶段二：自动降级 3 位小数尾数 (.001 ~ .999) ===
+        if not final_amount:
+            is_three_digits = True
+            for _ in range(50):
+                tail_int = random.randint(1, 999)
+                if tail_int % 10 == 0: 
+                    continue
+                tail_str = f"0.{tail_int:03d}"
+                test_amount = Decimal(str(base_amount)) + Decimal(tail_str)
+                
+                stmt = select(MicroDepositOrder).where(
+                    MicroDepositOrder.expected_amount == test_amount,
+                    MicroDepositOrder.status == 'PENDING',
+                    MicroDepositOrder.expired_at > now_time
+                )
+                if not (await session.execute(stmt)).scalar_one_or_none():
+                    final_amount = test_amount
+                    break
+
+        if not final_amount:
+            return await wait_msg.edit_text("❌ 当前充值通道极其繁忙，请稍后或更换金额重试。")
+
+        # 查询代理老板自己的散客 User ID（维持外键关联一致性）
+        user_record = await session.scalar(
+            select(User).where(User.tenant_id == current_tenant.id, User.tg_user_id == message.from_user.id)
+        )
+        user_id_val = user_record.id if user_record else 0
+        fractional_val = final_amount - Decimal(str(base_amount))
+
+        # 将订单写入数据库锁定尾数
+        new_order = MicroDepositOrder(
+            tenant_id=current_tenant.id,
+            user_id=user_id_val,
+            base_amount=base_amount,
+            fractional_amount=fractional_val,
+            expected_amount=final_amount,
+            status='PENDING',
+            expired_at=expire_time
+        )
+        session.add(new_order)
+        await session.commit()
+
+        # 第三步：渲染标准收银台卡片
+        amount_display = f"{final_amount:.2f}" if not is_three_digits else f"{final_amount:.3f}"
+        invoice_text = (
+            "✅ <b>专属充值订单已生成！</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🚨 <b>⚠️ 核心安全警告（非常重要）：</b>\n"
+            "系统采用智能尾数识别记账，请务必<b>【一分不差】</b>地转账下方带有小数点的精确金额！\n"
+            "多付、少付、抹零、或者自行凑整均会导致资金丢失且无法自动到账！\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💰 <b>需转账精确金额：</b>\n"
+            f"<code>{amount_display}</code> TRX 👈 <i>(点击数字自动复制)</i>\n\n"
+            "📥 <b>充值收款地址：</b>\n"
+            f"<code>{master_wallet}</code> 👈 <i>(点击地址自动复制)</i>\n\n"
+            "⏱ <i>本订单有效期仅 <b>10 分钟</b>，请抓紧时间支付。转账后 1-3 分钟内智能合约自动为您核销并增加进货本金。</i>"
+        )
+        
+        # 附带返回个人中心按钮
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 返回个人中心", callback_data="back_to_tenant_home")]
+        ])
+        
+        await wait_msg.edit_text(invoice_text, reply_markup=kb, parse_mode="HTML")
+
+    except Exception as e:
+        await session.rollback()
+        await wait_msg.edit_text(f"❌ 专属通道锁定失败，入库异常：{str(e)}")
 
 # =========================================================
 # 辅助逻辑：配合上述面板的返回动作
