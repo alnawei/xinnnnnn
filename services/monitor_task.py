@@ -116,7 +116,7 @@ async def run_financial_monitor(session_maker, bot, netts_service=None):
                                 tenant_chat_id = int(str(tenant_tg_id).strip())
                                 reminder_msg = (
                                     f"🔔 <b>【商铺本金不足提醒】</b>\n\n"
-                                    f"🤖 您的全自动能量机器人 (租户ID: #{tenant.id}) 进货本金已跌破预警线！\n"
+                                    f"🤖 您的全自动能量机器人进货本金已跌破预警线！\n"
                                     f"💳 当前可用本金：<code>{float(current_balance):g}</code> TRX\n"
                                     f"🛑 最低预警线：<code>{tenant_threshold:g}</code> TRX\n\n"
                                     f"<i>为保证自动发货，请及时充值。恢复前不再重复提醒。</i>"
