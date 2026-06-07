@@ -14,12 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from filters.role import RoleFilter
+from netts_api import delegate_energy
 # 必须确保导入了 SaasOrder 和 SystemConfig
 from models import SystemConfig, Tenant, User, UserReceiveAddress, MicroDepositOrder, EnergyOrder, SaaSOrder
 # 导入您项目对应的模型与统一的主回复键盘构建器
 from config import SAAS_BOT_URL
 from keyboards.reply import build_user_main_keyboard
-from services.netts_service import delegate_energy
 from sqlalchemy import select, desc
 from tron_scanner import handle_balance_purchase
 import re  # 👈 追加这行：导入正则表达式模块
