@@ -201,7 +201,7 @@ async def admin_menu_settings(message: Message, session: AsyncSession, state: FS
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💁 客服配置(增删改/显隐)", callback_data="admin_set_customer_service")],
+        [InlineKeyboardButton(text="💁 客服配置", callback_data="admin_set_customer_service")],
         [InlineKeyboardButton(text="🏦 全站收款主地址配置", callback_data="admin_set_master_wallet")],
         [InlineKeyboardButton(text="🌐 Tron API 节点池管理", callback_data="admin_set_tron_api")],
         [InlineKeyboardButton(text="👋 全局默认欢迎语设置", callback_data="admin_set_welcome_msg")],
