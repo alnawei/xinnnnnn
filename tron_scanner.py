@@ -119,10 +119,9 @@ async def handle_balance_purchase(
 # =====================================================================
 # 辅助核销发货函数：特价静默派发与状态流转（带失败自动退款防线）
 # =====================================================================
-async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker):
-    """特价能量静默发货引擎：发货、更新订单状态，失败必须退回代理本金！"""
-    # 1. 尝试真实发货
-    success = await fire_netts_silent(target_address, amount)
+async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker, duration: str = "1H"):
+    """特价静默发货引擎：接收动态 duration"""
+    success = await fire_netts_silent(target_address, amount, duration)
     
     # 2. 异步另起会话处理财务状态，防止阻塞主循环
     async with session_maker() as session:
@@ -281,7 +280,6 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession, min_times
 # ==================== 4. 后台全自动扫块主循环 ====================
 
 # 🧠 SRE 终极防线：将游标字典声明在【全局作用域 (Module Level)】！
-# 彻底杜绝任何因函数重入、异常重启引发的作用域重置与游标归零问题！
 GLOBAL_CURSOR_TRX = {}
 GLOBAL_CURSOR_USDT = {}
 
@@ -376,10 +374,7 @@ async def run_scanner(bot, session_maker):
                             to_address = hex_to_base58(raw_to_address)
                             from_address = hex_to_base58(raw_from_address)
 
-                            logging.info(f"🔍 [解析调试] 扫到交易哈希: {tx_hash}, 类型: {c_type}, 到账地址: {to_address}")
-
                             if c_type != "TransferContract":
-                                logging.warning(f"🚫 [拦截] 交易类型不符或非目标合约 ({c_type})")
                                 continue
 
                             if str(to_address).strip() != str(current_addr).strip() or str(from_address).strip() == str(current_addr).strip():
@@ -440,14 +435,11 @@ async def run_scanner(bot, session_maker):
                                     else:
                                         await session.rollback()
                                 else:
-                                    logging.warning(f"🚫 [拦截] 充值盲配失败: 未找到金额为 {actual_trx_amount} 的 PENDING 订单。")
                                     await session.rollback()
 
                             # 🔀 分流 2：租户专属特价静默直转
                             elif current_addr in tenant_addr_map:
                                 target_tenant_id = tenant_addr_map[current_addr]
-                                logging.info(f"🔄 [追踪-2/5] 匹配为租户 #{target_tenant_id} 的特价收款，准备盲配...")
-                                
                                 tenant = (await session.execute(
                                     select(Tenant).where(Tenant.id == target_tenant_id).with_for_update()
                                 )).scalar_one_or_none()
@@ -476,6 +468,9 @@ async def run_scanner(bot, session_maker):
                                         if deduction_cost > 0 and tenant.deposit_balance >= deduction_cost:
                                             tenant.deposit_balance = tenant.deposit_balance - deduction_cost
                                             
+                                            # 获取代理设置的发货时效 (默认为 1h)
+                                            tenant_dur = getattr(tenant, "special_energy_duration", "1h")
+                                            
                                             new_order = EnergyOrder(
                                                 tenant_id=tenant.id, order_type=order_type, target_address=from_address,
                                                 admin_base_cost=deduction_cost, tenant_markup=Decimal(str(actual_trx_amount)) - deduction_cost,
@@ -487,27 +482,56 @@ async def run_scanner(bot, session_maker):
                                             try:
                                                 await session.commit()
                                                 await session.refresh(new_order)
-                                                logging.info(f"🎉 [特价派发] 代理本金暗扣成功！已拉起 Netts 发货任务。")
-                                                asyncio.create_task(dispatch_special_energy(from_address, energy_amount, new_order.id, session_maker))
+                                                logging.info(f"🎉 [特价派发] 代理本金暗扣成功！已拉起 Netts 发货任务 (时效: {tenant_dur})。")
+                                                # 注入动态时效发送能量
+                                                asyncio.create_task(dispatch_special_energy(from_address, energy_amount, new_order.id, session_maker, duration=tenant_dur))
                                             except Exception as e:
                                                 await session.rollback()
                                                 logging.error(f"❌ 订单生成失败: {e}")
                                         else:
-                                            logging.warning(f"🚫 [拦截] 代理本金不足以扣除成本 {deduction_cost} TRX，已拒绝静默派发。")
+                                            logging.warning(f"🚫 [拦截] 代理本金不足，拒绝发货。")
                                             await session.rollback()
                                     else:
-                                        logging.warning(f"🚫 [拦截] 金额 {float_actual} TRX 与特价档位不符。")
                                         await session.rollback()
                                 else:
-                                    logging.warning(f"🚫 [拦截] 未找到对应收款代理商(或已被封禁)！")
                                     await session.rollback()
+
+                            # 🔀 分流 3：全局超管兜底特价直转 (最高利润率直营盘)
+                            elif sys_config.global_special_address and current_addr == str(sys_config.global_special_address).strip():
+                                float_actual = float(actual_trx_amount)
+                                float_65k = float(sys_config.special_base_cost_65k or 0)
+                                float_131k = float(sys_config.special_base_cost_131k or 0)
+                                
+                                energy_amount = 0
+                                
+                                if float_65k > 0 and float_actual == float_65k:
+                                    energy_amount = 65000
+                                elif float_131k > 0 and float_actual == float_131k:
+                                    energy_amount = 131000
+                                    
+                                if energy_amount > 0:
+                                    logging.info(f"✅ [追踪] 盲配成功！命中全局超管特价档位, 能量: {energy_amount}")
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    try:
+                                        await session.commit()
+                                        logging.info(f"🎉 [特价派发] 💰 超管直营订单落盘！已拉起 Netts 发货任务 (强制时效: 5m)。")
+                                        # 💡 核心解绑：直营盘无需走内部扣费清算表，直接调用底层静默 API，强制 5M 利润最大化！
+                                        from netts_api import fire_netts_silent
+                                        asyncio.create_task(fire_netts_silent(from_address, energy_amount, "5m"))
+                                    except Exception as e:
+                                        await session.rollback()
+                                        logging.error(f"❌ 全局特价防双花落盘失败: {e}")
+                                else:
+                                    await session.rollback()
+                            
+                            # 🔀 分流 4：未知杂音地址拦截
+                            else:
+                                await session.rollback()
 
                         # 💡 循环结束后：强制更新下一轮请求的游标
                         if max_ts_in_batch > current_min_ts_trx:
                             GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
-                            logging.info(f"⏱️ [游标推进-TRX] 地址 {current_addr[:8]} 最新扫描时间戳已推至: {max_ts_in_batch}")
 
-                    # 阵列防封避退：每个地址查询之间休眠 0.3 秒
                     await asyncio.sleep(0.3)
 
                 # ========================================================
@@ -533,7 +557,7 @@ async def run_scanner(bot, session_maker):
                             max_ts_usdt_batch = block_ts
                             
                         # 2️⃣ 🔇 内存静默拦截
-                        if current_min_ts_usdt > 0 and block_ts <= current_min_ts_usdt:
+                        if block_ts <= current_min_ts_usdt:
                             continue
                             
                         # 3️⃣ 超时废单拦截
@@ -581,13 +605,14 @@ async def run_scanner(bot, session_maker):
                                 await session.rollback()
                                 logging.error(f"❌ [Scanner] SaaS USDT 持久化失败: {db_err}")
                         else:
-                            logging.warning(f"🚫 [拦截] 未找到金额为 {actual_usdt} USDT 的 PENDING 订单。")
                             await session.rollback()
 
                     # 💡 循环结束后：更新 USDT 游标
                     if max_ts_usdt_batch > current_min_ts_usdt:
                         GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
-                        logging.info(f"⏱️ [游标推进-USDT] 主钱包时间戳已推至: {max_ts_usdt_batch}")
+
+                # 阵列防封避退：每轮查询之间休眠 0.3 秒
+                await asyncio.sleep(0.3)
 
         except Exception as e:
             logging.error(f"❌ [Scanner] 扫块循环发生严重异常: {e}", exc_info=True)
