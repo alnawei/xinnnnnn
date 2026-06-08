@@ -97,6 +97,7 @@ class Tenant(Base):
     is_banned = Column(Boolean, default=False)
     special_price_65k = Column(Numeric(18, 6), default=0) # 65K 特价绝对售价 (0代表未开启)
     special_price_131k = Column(Numeric(18, 6), default=0) # 131K 特价绝对售价 (0代表未开启)
+    special_energy_duration = Column(String(10), default='1h') # 新增：特价能量时效 ('5m' 或 '1h')
 
 # ==================== 5. C端消费者表 ====================
 class User(Base):
