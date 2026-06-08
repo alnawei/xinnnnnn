@@ -1035,12 +1035,15 @@ async def tenant_special_settings_handler(message: Message, current_tenant: Tena
         return await message.answer("⚠️ <b>您尚未开通特价功能！</b>\n请先点击键盘上的【⚡ 开通特价】了解并订阅该服务。", parse_mode="HTML")
         
     special_addr = current_tenant.special_energy_address if current_tenant.special_energy_address else "未设置"
-    
     price_65k = float(getattr(current_tenant, 'special_price_65k', 0.0) or 0.0)
     price_131k = float(getattr(current_tenant, 'special_price_131k', 0.0) or 0.0)
+    duration = getattr(current_tenant, 'special_energy_duration', '1h')
     
     str_65k = f"{price_65k:.2f} TRX" if price_65k > 0 else "未开启"
     str_131k = f"{price_131k:.2f} TRX" if price_131k > 0 else "未开启"
+    
+    dur_5m_status = " 🟢 运行中" if duration == '5m' else ""
+    dur_1h_status = " 🟢 运行中" if duration == '1h' else ""
     
     text = (
         "⚙️ <b>特价功能核心设置</b>\n"
@@ -1048,6 +1051,8 @@ async def tenant_special_settings_handler(message: Message, current_tenant: Tena
         f"📥 <b>特价静默发货地址</b>：\n<code>{special_addr}</code>\n\n"
         f"💰 <b>65K 特价静默价格</b>：<code>{str_65k}</code>\n"
         f"💰 <b>131K 特价静默价格</b>：<code>{str_131k}</code>\n"
+        f"⏱ <b>时效 5 分钟</b>：{dur_5m_status}\n"
+        f"⏱ <b>时效 1 小时</b>：{dur_1h_status}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "👇 请选择您要配置的项目："
     )
@@ -1057,11 +1062,32 @@ async def tenant_special_settings_handler(message: Message, current_tenant: Tena
         [
             InlineKeyboardButton(text="💰 设 65K 价格", callback_data="tenant_set_special_65k"),
             InlineKeyboardButton(text="💰 设 131K 价格", callback_data="tenant_set_special_131k")
+        ],
+        [
+            InlineKeyboardButton(text="⏳ 设为 5 分钟", callback_data="tenant_set_dur_5m"),
+            InlineKeyboardButton(text="⏳ 设为 1 小时", callback_data="tenant_set_dur_1h")
         ]
     ])
-    
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
+@tenant_router.callback_query(F.data.in_(["tenant_set_dur_5m", "tenant_set_dur_1h"]))
+async def cb_set_special_duration(call: CallbackQuery, current_tenant: Tenant, session: AsyncSession, state: FSMContext):
+    """处理租户动态修改特价能量时效"""
+    new_dur = '5m' if call.data == "tenant_set_dur_5m" else '1h'
+    await session.execute(
+        update(Tenant).where(Tenant.id == current_tenant.id).values(special_energy_duration=new_dur)
+    )
+    await session.commit()
+    # 同步更新内存对象供下文渲染
+    current_tenant.special_energy_duration = new_dur
+    
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    # 重新渲染主界面并提示
+    await tenant_special_settings_handler(call.message, current_tenant, state)
+    await call.answer(f"✅ 时效已成功切换为 {'5 分钟' if new_dur == '5m' else '1 小时'}！", show_alert=False)
 # --- 1. 设置特价发货地址 ---
 @tenant_router.callback_query(F.data == "tenant_set_special_addr")
 async def trigger_set_special_addr(call: CallbackQuery, state: FSMContext):
