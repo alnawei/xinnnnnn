@@ -311,12 +311,20 @@ def get_user_router() -> Router:
         elif show_131k:
             special_price_text = f"\n└ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{price_131k_special} TRX"
 
+        # 💡 新增：获取时效展示文案。租户取自身配置，超管兜底强制显示为 5 分钟
+        if getattr(current_tenant, "has_special_energy_right", False):
+            dur_val = getattr(current_tenant, "special_energy_duration", "1h")
+        else:
+            dur_val = "5m"
+        dur_cn = "5分钟" if dur_val == "5m" else "1小时"
+
         # 4. 组装并回复纯净特价卡片文案
         special_card_text = (
             "⚡️ <b>专属限时特价能量供应</b>\n\n"
             "<b>💥 特价费率：</b>"
             f"{special_price_text}\n"
             "├ 📥 <b>使用教程</b>：转账对应数量的 TRX 到下面地址，3秒后再去转 U 不扣 TRX 手续费！\n"
+            f"├ ⏱ <b>时效说明</b>：能量 <b>{dur_cn}</b> 内有效，到期自动收回。\n"  # 👈 核心修改：动态插入时效说明
             "└ ✅ <b>能量租用地址 (点击自动复制)</b>：\n"
             f"<code>{special_address}</code>\n"
             "   <i>(付款后立即生效，秒到不提醒)</i>\n\n"
