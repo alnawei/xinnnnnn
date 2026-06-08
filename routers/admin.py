@@ -1254,7 +1254,7 @@ async def generate_activation_code_finish(message: Message, state: FSMContext, s
         f"🔑 激活码：<code>{new_code_str}</code>\n"
         f"📦 包含特权：{privilege_text}\n"
         f"⏱️ 有效期：{duration_days} 天\n\n"
-        "<i>请将此激活码发送给您的代理客户。</i>"
+        "<i>请将此激活码发送给您的代理客户。\n向机器人发送 /activate 完成自助挂载。</i>"
     )
     await message.answer(text, parse_mode="HTML")
     await state.clear()
