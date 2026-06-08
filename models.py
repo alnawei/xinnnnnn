@@ -152,7 +152,7 @@ class EnergyOrder(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, nullable=False)
     user_id = Column(BigInteger)
-    order_type = Column(Enum('BALANCE_65K', 'BALANCE_131K', 'DIRECT_SPECIAL'), nullable=False)
+    order_type = Column(Enum('BALANCE_65K', 'BALANCE_131K', 'DIRECT_SPECIAL', 'DIRECT_SPECIAL_65K', 'DIRECT_SPECIAL_131K'), nullable=False)
     target_address = Column(String(34), nullable=False)
     admin_base_cost = Column(Numeric(18, 6), default=0)
     tenant_markup = Column(Numeric(18, 6), default=0)
