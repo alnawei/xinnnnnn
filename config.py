@@ -21,5 +21,5 @@ SAAS_BOT_URL = "https://t.me/YourSaaSBotUsername"
 # ================= 3. 供应链与发货配置 (Netts API) =================
 SERVER_IP = "47.2xxxxxxx"           # 绑定 Netts 的白名单公网 IP
 NETTS_API_KEY = "5350bb644xxxxxxxx"   
-NETTS_ORDER_URL = "https://netts.io/apiv2/time/add"  # 注意：这里应根据 api-v2.md 调整为您实际使用的接口
+NETTS_ORDER_URL = "https://netts.io/apiv2/order1h"
 NETTS_PRICING_URL = "https://netts.io/apiv2/pricing"
