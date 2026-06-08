@@ -37,9 +37,8 @@ async def fire_netts_silent(address: str, amount: int) -> bool:
         "X-Real-IP": SERVER_IP,
         "Content-Type": "application/json"
     }
-        # 💡 核心修复 3：严格对齐官方文档，目标地址字段必须叫 receiveAddress！
     payload = {
-        "receiveAddress": address,
+        "address": address,
         "amount": amount
     }
     try:
@@ -56,12 +55,16 @@ async def fire_netts_silent(address: str, amount: int) -> bool:
                         logging.error("❌ [Netts API] 返回数据不是合法 JSON，发货失败。")
                         return False
                         
-                    # 💡 核心修复 2：严格判定业务成功码 (依据 Netts v2 接口规范 code == 0 为成功)
-                    if data.get("code") == 0 or data.get("success") is True or data.get("status") == "success":
+                    # 💡 核心修复 2：兼容 Netts v2 嵌套结构，并识别 code 10000 为成功
+                    # 尝试剥离外层的 "detail" 壳子，如果没有 detail 就用原本的 data
+                    detail_data = data.get("detail", data)
+                    
+                    if detail_data.get("code") in [0, 10000] or detail_data.get("success") is True or detail_data.get("status") == "success":
                         logging.info(f"✅ [Netts API] 静默发货成功 -> 地址: {address} | 能量: {amount}")
                         return True
                     else:
-                        logging.warning(f"❌ [Netts API] 订单被上游拒绝！错误详情: {data.get('msg', data.get('message', '未知业务拦截'))}")
+                        err_msg = detail_data.get('msg', detail_data.get('message', '未知业务报错'))
+                        logging.warning(f"❌ [Netts API] 订单被上游拒绝！错误详情: {err_msg}")
                         return False
                 else:
                     logging.error(f"❌ [Netts API] HTTP 请求异常，状态码: {resp.status}")
@@ -69,7 +72,6 @@ async def fire_netts_silent(address: str, amount: int) -> bool:
     except Exception as e:
         logging.error(f"❌ [Netts API] 发货网络故障: {e}")
         return False
-
 
 # =========================================================
 # 追加功能：供 C 端直接调用的精细化发货接口与查余额接口
