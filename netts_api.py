@@ -31,32 +31,43 @@ async def fire_netts_silent(address: str, amount: int) -> bool:
     🚨 静默发货引擎 (供 tron_scanner.py 扫块底层使用) 
     作为 SaaS 底层，无论发货成功与否，绝不抛出任何 Exception 阻断扫块中枢的主循环。
     """
+    import json
     headers = {
         "X-API-KEY": NETTS_API_KEY,
         "X-Real-IP": SERVER_IP,
         "Content-Type": "application/json"
     }
+        # 💡 核心修复 3：严格对齐官方文档，目标地址字段必须叫 receiveAddress！
     payload = {
-        "address": address,
+        "receiveAddress": address,
         "amount": amount
     }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(NETTS_ORDER_URL, json=payload, headers=headers, timeout=12) as resp:
+                # 💡 核心修复 1：强制截获并打印上游原始字符串响应，彻底打破黑盒！
+                raw_text = await resp.text()
+                logging.info(f"🌐 [Netts API 原始响应] HTTP {resp.status} | 内容: {raw_text}")
+                
                 if resp.status == 200:
-                    data = await resp.json()
-                    # 兼容 Netts 的 JSON 响应，具体判断根据实际回调进行调整
-                    if data.get("success") is True or data.get("code") == 0 or "order_id" in data:
-                        logging.info(f"[Netts API] 静默成功派发 -> 地址: {address} | 能量: {amount}")
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        logging.error("❌ [Netts API] 返回数据不是合法 JSON，发货失败。")
+                        return False
+                        
+                    # 💡 核心修复 2：严格判定业务成功码 (依据 Netts v2 接口规范 code == 0 为成功)
+                    if data.get("code") == 0 or data.get("success") is True or data.get("status") == "success":
+                        logging.info(f"✅ [Netts API] 静默发货成功 -> 地址: {address} | 能量: {amount}")
                         return True
                     else:
-                        logging.warning(f"[Netts API] 订单被拒，响应数据: {data}")
+                        logging.warning(f"❌ [Netts API] 订单被上游拒绝！错误详情: {data.get('msg', data.get('message', '未知业务拦截'))}")
                         return False
                 else:
-                    logging.error(f"[Netts API] HTTP 请求异常: {resp.status}")
+                    logging.error(f"❌ [Netts API] HTTP 请求异常，状态码: {resp.status}")
                     return False
     except Exception as e:
-        logging.error(f"[Netts API] 发货网络故障: {e}")
+        logging.error(f"❌ [Netts API] 发货网络故障: {e}")
         return False
 
 
