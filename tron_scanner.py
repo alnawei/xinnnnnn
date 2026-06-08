@@ -19,7 +19,7 @@ from models import (
     SystemConfig, User, Tenant, TronApiNode, EnergyOrder
 )
 
-# 导入真实发货接口
+# 导入真实发货接口 (底层已支持动态 duration 分流 URL)
 from netts_api import fire_netts_silent
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -82,11 +82,11 @@ async def handle_balance_purchase(
     tenant_id: int,          
     tenant_profit: Decimal   
 ):
-    """【散户余额购单】强一致性闭环：发货、改状态、代理分润、失败退款。"""
+    """【散户余额购单】强一致性闭环：默认走 1h 发货、改状态、代理分润、失败退款。"""
     amount = 65000 if "65K" in amount_type else 131000
 
     async with AsyncSessionLocal() as session:
-        # 调用真实 Netts 网络发货
+        # 💡 散户常规购买，默认不传 duration，底层直接走 1h 接口
         success = await fire_netts_silent(address, amount)
         
         if success:
@@ -116,11 +116,14 @@ async def handle_balance_purchase(
             await session.commit()
             await send_tg_message(user_id, "❌ <b>能量派发失败</b>\n\n上游网络波动或库存不足，派发中断。<b>扣除的 TRX 已全额安全退回至您的账户</b>，请稍后重试！")
 
+
 # =====================================================================
 # 辅助核销发货函数：特价静默派发与状态流转（带失败自动退款防线）
 # =====================================================================
-async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker, duration: str = "1H"):
-    """特价静默发货引擎：接收动态 duration"""
+async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker, duration: str = "1h"):
+    """特价能量静默发货引擎：发货、更新订单状态，失败必须退回代理本金！"""
+    
+    # 💡 核心修复：把 duration 透传给底层的 Netts 发货函数
     success = await fire_netts_silent(target_address, amount, duration)
     
     # 2. 异步另起会话处理财务状态，防止阻塞主循环
@@ -138,7 +141,7 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
             if success:
                 order.status = 'SUCCESS'
                 await session.commit()
-                logging.info(f"🎉 [发货回执] 订单 #{order_id} 能量下发成功，资金流转闭环完成！")
+                logging.info(f"🎉 [发货回执] 订单 #{order_id} 能量下发成功({duration})，资金流转闭环完成！")
             else:
                 logging.warning(f"⚠️ [发货回执] 订单 #{order_id} 发货失败，立即启动代理商本金退款程序...")
                 order.status = 'FAILED_REFUNDED'
@@ -149,7 +152,7 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
                 )).scalar_one_or_none()
                 
                 if tenant:
-                    # 💡 核心财务修复：将当时扣除的进货底价成本，原分不动地加回代理商的 deposit_balance
+                    # 💡 核心财务修复：将当时扣除的进货底价成本，一分不动地加回代理商的 deposit_balance
                     refund_amount = order.admin_base_cost
                     tenant.deposit_balance = tenant.deposit_balance + refund_amount
                     logging.info(f"✅ [发货回执] 退款成功！已向租户 #{tenant.id} 的进货本金池退回 {refund_amount} TRX。")
@@ -161,6 +164,7 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
         except Exception as e:
             await session.rollback()
             logging.error(f"❌ [发货回执] 状态流转或退款落盘发生严重异常: {e}", exc_info=True)
+
 
 # ==================== 3. 动态节点池与链上数据请求 ====================
 
@@ -287,7 +291,6 @@ async def run_scanner(bot, session_maker):
     """后台扫块主循环：双轨全局游标阵列轮询、悲观锁防双花"""
     logging.info("🚀 [Scanner] 波场全自动多地址阵列游标扫块引擎已启动...")
     
-    import time
     loop_count = 0
     
     while True:
@@ -332,7 +335,6 @@ async def run_scanner(bot, session_maker):
                 # 引擎 A：原生 TRX 进账全局滑动监听
                 # ========================================================
                 for current_addr in watch_addresses:
-                    # 1. 提取全局游标记忆 (无记录则默认为兜底时间，绝不受系统时间干扰)
                     current_min_ts_trx = GLOBAL_CURSOR_TRX.get(current_addr, fallback_ts)
                     trx_response = await fetch_tron_transactions(current_addr, session, current_min_ts_trx)
                     
@@ -342,28 +344,23 @@ async def run_scanner(bot, session_maker):
                         max_ts_in_batch = current_min_ts_trx
     
                         for tx in trx_txs:
-                            # 💡 核心修复：统一变量名，彻底消灭 UnboundLocalError
                             tx_hash = tx.get("txID", tx.get("transaction_id", "Unknown"))
                             if tx_hash == "Unknown" or tx_hash in batch_processed_hashes:
                                 continue
                             
                             block_ts = tx.get("block_timestamp", 0)
                             
-                            # 1️⃣ 绝对第一优先级：无论这笔交易要不要，先把它的时间戳记录下来推动游标！
                             if block_ts > max_ts_in_batch:
                                 max_ts_in_batch = block_ts
                                 
-                            # 2️⃣ 🔇 终极绝对静默防线（小于等于全局游标，直接哑巴跳过！）
                             if current_min_ts_trx > 0 and block_ts <= current_min_ts_trx:
                                 continue
                                 
-                            # 3️⃣ 第三优先级：超时拦截（打印黄色警告，不查库不写库，直接丢弃）
                             current_ts_ms = int(time.time() * 1000)
                             if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
                                 logging.warning(f"🚫 [拦截] 订单已超时丢弃 (距今已超60秒)。TXID: {tx_hash}")
                                 continue
 
-                            # 4️⃣ 下面才是正常的业务解析与查库逻辑
                             contract = tx.get("raw_data", {}).get("contract", [{}])[0]
                             c_type = contract.get("type")
                             param = contract.get("parameter", {}).get("value", {})
@@ -406,8 +403,6 @@ async def run_scanner(bot, session_maker):
                                 matched_orders = (await session.execute(order_stmt)).scalars().all()
                                 
                                 if matched_orders:
-                                    if len(matched_orders) > 1:
-                                        logging.warning(f"⚠️ [防撞击警告] 监听到金额 {actual_trx_amount} 存在多笔并发 PENDING 订单！将自动匹配最早的订单 #{matched_orders[0].id}。")
                                     matched_order = matched_orders[0]
                                     matched_order.status = "SUCCESS"
                                     
@@ -437,7 +432,7 @@ async def run_scanner(bot, session_maker):
                                 else:
                                     await session.rollback()
 
-                            # 🔀 分流 2：租户专属特价静默直转
+                            # 🔀 分流 2：租户专属特价静默直转 (🔥 核心成本与时效解绑区)
                             elif current_addr in tenant_addr_map:
                                 target_tenant_id = tenant_addr_map[current_addr]
                                 tenant = (await session.execute(
@@ -461,6 +456,8 @@ async def run_scanner(bot, session_maker):
                                         
                                     if order_type:
                                         await session.refresh(sys_config)
+                                        
+                                        # 💡 核心解绑点：扣除成本依然按照超管后台配置的 1H 成本刚性扣除！绝不降价！
                                         netts_cost = Decimal(str(sys_config.netts_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.netts_cost_131k))
                                         draw_cost = Decimal(str(sys_config.base_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.base_cost_131k))
                                         deduction_cost = netts_cost + draw_cost
@@ -468,7 +465,7 @@ async def run_scanner(bot, session_maker):
                                         if deduction_cost > 0 and tenant.deposit_balance >= deduction_cost:
                                             tenant.deposit_balance = tenant.deposit_balance - deduction_cost
                                             
-                                            # 获取代理设置的发货时效 (默认为 1h)
+                                            # 💡 时效读取：获取代理设置的发货时效 (容错默认为 1h)
                                             tenant_dur = getattr(tenant, "special_energy_duration", "1h")
                                             
                                             new_order = EnergyOrder(
@@ -516,7 +513,6 @@ async def run_scanner(bot, session_maker):
                                         await session.commit()
                                         logging.info(f"🎉 [特价派发] 💰 超管直营订单落盘！已拉起 Netts 发货任务 (强制时效: 5m)。")
                                         # 💡 核心解绑：直营盘无需走内部扣费清算表，直接调用底层静默 API，强制 5M 利润最大化！
-                                        from netts_api import fire_netts_silent
                                         asyncio.create_task(fire_netts_silent(from_address, energy_amount, "5m"))
                                     except Exception as e:
                                         await session.rollback()
@@ -528,7 +524,7 @@ async def run_scanner(bot, session_maker):
                             else:
                                 await session.rollback()
 
-                        # 💡 循环结束后：强制更新下一轮请求的游标
+                        # 循环结束后：强制更新下一轮请求的游标
                         if max_ts_in_batch > current_min_ts_trx:
                             GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
 
@@ -552,21 +548,17 @@ async def run_scanner(bot, session_maker):
                         
                         block_ts = tx.get("block_timestamp", 0)
                         
-                        # 1️⃣ 绝对第一优先级：提取最大时间戳
                         if block_ts > max_ts_usdt_batch:
                             max_ts_usdt_batch = block_ts
                             
-                        # 2️⃣ 🔇 内存静默拦截
                         if block_ts <= current_min_ts_usdt:
                             continue
                             
-                        # 3️⃣ 超时废单拦截
                         current_ts_ms = int(time.time() * 1000)
                         if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
                             logging.warning(f"🚫 [拦截] USDT 订单已超时丢弃 (距今已超60秒)！TXID: {tx_hash}")
                             continue
                         
-                        # 4️⃣ 下方为正常业务验证逻辑
                         if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
                             continue
 
@@ -589,8 +581,6 @@ async def run_scanner(bot, session_maker):
                         matched_saas_list = (await session.execute(saas_stmt)).scalars().all()
                         
                         if matched_saas_list:
-                            if len(matched_saas_list) > 1:
-                                logging.warning(f"⚠️ [防撞击警告] USDT 金额 {actual_usdt} 存在多笔 PENDING，匹配订单 #{matched_saas_list[0].id}。")
                             matched_saas = matched_saas_list[0]
                             matched_saas.status = "PAID"
                             
@@ -607,7 +597,6 @@ async def run_scanner(bot, session_maker):
                         else:
                             await session.rollback()
 
-                    # 💡 循环结束后：更新 USDT 游标
                     if max_ts_usdt_batch > current_min_ts_usdt:
                         GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
 
@@ -633,14 +622,11 @@ if __name__ == "__main__":
     
     async def standalone_main():
         logging.info("🚀 准备点火！波场双轨扫块独立引擎启动中...")
-        # 1. 独立初始化用于发送到账通知的 Bot 实例
         master_bot = Bot(token=MASTER_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
         
         try:
-            # 2. 拉起主循环，注入 Bot 与数据库会话工厂
             await run_scanner(master_bot, AsyncSessionLocal)
         finally:
-            # 优雅退出，释放 aiohttp 会话
             logging.info("🧹 正在释放扫块引擎资源...")
             await master_bot.session.close()
 
