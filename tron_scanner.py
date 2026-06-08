@@ -4,20 +4,19 @@ import asyncio
 import aiohttp
 import logging
 import random
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, update
-
 from config import MASTER_BOT_TOKEN
 from models import (
     AsyncSessionLocal, 
     ProcessedTx, MicroDepositOrder, SaaSOrder,
-    SystemConfig, User, Tenant, TronApiNode
+    SystemConfig, User, Tenant, TronApiNode, EnergyOrder
 )
-
 # 导入真实发货接口
 from netts_api import fire_netts_silent
 
@@ -27,7 +26,38 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 USDT_CONTRACT_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 # ==================== 1. 独立工具库 ====================
-
+def hex_to_base58(hex_addr: str) -> str:
+    """
+    原生纯 Python 实现的 Hex 转 Base58Check (波场标准)
+    完全零外部依赖，摆脱环境报错！
+    """
+    if not hex_addr or not hex_addr.startswith("41") or len(hex_addr) != 42:
+        return hex_addr
+        
+    try:
+        # 1. 16进制转 bytes
+        addr_bytes = bytes.fromhex(hex_addr)
+        
+        # 2. 计算双重 SHA256
+        hash1 = hashlib.sha256(addr_bytes).digest()
+        hash2 = hashlib.sha256(hash1).digest()
+        
+        # 3. 追加前4字节校验和
+        full_payload = addr_bytes + hash2[:4]
+        
+        # 4. 原生 Base58 编码数学算法
+        ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        num = int.from_bytes(full_payload, 'big')
+        
+        res = []
+        while num > 0:
+            num, rem = divmod(num, 58)
+            res.append(ALPHABET[rem])
+            
+        return "".join(reversed(res))
+    except Exception:
+        return hex_addr
+        
 async def send_tg_message(user_id: int, text: str):
     """独立脚本专用的 TG 消息推送器，不依赖 aiogram dispatcher"""
     url = f"https://api.telegram.org/bot{MASTER_BOT_TOKEN}/sendMessage"
@@ -104,8 +134,8 @@ async def process_silent_purchase(tx_hash: str, address: str, amount: Decimal, s
 
 # ==================== 3. 动态节点池与链上数据请求 ====================
 
-async def fetch_tron_transactions(address: str, session: AsyncSession) -> dict:
-    """带节点池轮询、自适应熔断与重试机制的原生 TRX API 请求函数"""
+async def fetch_tron_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
+    """带节点池轮询、自适应熔断的原生 TRX API 请求引擎 (加装时间滑动窗口)"""
     stmt = select(TronApiNode).where(TronApiNode.is_active == True)
     nodes = (await session.execute(stmt)).scalars().all()
     
@@ -115,6 +145,15 @@ async def fetch_tron_transactions(address: str, session: AsyncSession) -> dict:
         nodes = [DummyNode()]
     else:
         random.shuffle(nodes)
+        
+    # 🚨 扩容视野：单次拉取提升至 200 条，防止高并发瞬间挤出盲区
+    params = {
+        "limit": "200",
+        "visible": "true" 
+    }
+    # 动态附加游标：只拉取该时间戳之后的新交易
+    if min_timestamp:
+        params["min_timestamp"] = str(min_timestamp)
         
     async with aiohttp.ClientSession() as client:
         for node in nodes:
@@ -126,30 +165,23 @@ async def fetch_tron_transactions(address: str, session: AsyncSession) -> dict:
             if current_key:
                 headers["TRON-PRO-API-KEY"] = current_key.strip()
                 
-# 🚨 核心修复：必须强制传入 visible=true 参数！
-            # 否则波场节点默认返回 '41' 开头的十六进制地址，导致后续 to_address 匹配永远为 False！
-            params = {
-                "visible": "true",
-                "only_to": "true",
-                "limit": "50"
-            }
-            
             try:
-                # 将 params 参数塞入 GET 请求，并拉长超时时间防挂起
                 async with client.get(url, headers=headers, params=params, timeout=10) as response:
                     if response.status == 200:
+                        data = await response.json()
+                        tx_list = data.get("data", [])
+                        logging.info(f"🌐 [API探测-TRX] 地址 {address[:8]}... -> 状态 200, 拿到 {len(tx_list)} 条记录")
+                        
                         if node.id is not None:
                             node.fail_count = 0
                             node.last_used_at = datetime.utcnow()
                             await session.commit()
-                        return await response.json()
-                        
+                        return data
                     elif response.status in [429, 502, 503, 504]:
                         if node.id is not None:
                             node.fail_count += 1
                             if node.fail_count >= 10:
                                 node.is_active = False
-                                logging.warning(f"🚨 [节点熔断] TRX 节点 #{node.id} 连续失败 10 次已软熔断！")
                             await session.commit()
                         continue
             except (asyncio.TimeoutError, aiohttp.ClientError):
@@ -159,11 +191,10 @@ async def fetch_tron_transactions(address: str, session: AsyncSession) -> dict:
                         node.is_active = False
                     await session.commit()
                 continue
-                
     return {"data": [], "success": False, "error": "All nodes failed"}
 
-async def fetch_usdt_transactions(address: str, session: AsyncSession) -> dict:
-    """带节点池轮询、防假币过滤的 TRC20 (USDT) API 请求引擎"""
+async def fetch_usdt_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
+    """带节点池轮询、防假币的 TRC20 (USDT) API 请求引擎 (加装时间滑动窗口)"""
     stmt = select(TronApiNode).where(TronApiNode.is_active == True)
     nodes = (await session.execute(stmt)).scalars().all()
     
@@ -175,10 +206,13 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession) -> dict:
         random.shuffle(nodes)
         
     params = {
-        "limit": "50",
+        "limit": "200",
         "contract_address": USDT_CONTRACT_ADDRESS,
-        "only_to": "true" 
+        "only_to": "true",
+        "visible": "true"
     }
+    if min_timestamp:
+        params["min_timestamp"] = str(min_timestamp)
         
     async with aiohttp.ClientSession() as client:
         for node in nodes:
@@ -191,20 +225,22 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession) -> dict:
                 headers["TRON-PRO-API-KEY"] = current_key.strip()
                 
             try:
-                async with client.get(url, headers=headers, params=params, timeout=5) as response:
+                async with client.get(url, headers=headers, params=params, timeout=10) as response:
                     if response.status == 200:
+                        data = await response.json()
+                        tx_list = data.get("data", [])
+                        logging.info(f"🌐 [API探测-USDT] 地址 {address[:8]}... -> 状态 200, 拿到 {len(tx_list)} 条记录")
+                        
                         if node.id is not None:
                             node.fail_count = 0
                             node.last_used_at = datetime.utcnow()
                             await session.commit()
-                        return await response.json()
-                        
+                        return data
                     elif response.status in [429, 502, 503, 504]:
                         if node.id is not None:
                             node.fail_count += 1
                             if node.fail_count >= 10:
                                 node.is_active = False
-                                logging.warning(f"🚨 [节点熔断] USDT 节点 #{node.id} 连续失败 10 次已软熔断！")
                             await session.commit()
                         continue
             except Exception:
@@ -214,229 +250,350 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession) -> dict:
                         node.is_active = False
                     await session.commit()
                 continue
-                
     return {"data": [], "success": False}
+# ==================== 4. 后台全自动扫块主循环 ====================
+
+# =====================================================================
+# 辅助核销发货函数：特价静默派发与状态流转
+# =====================================================================
+async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker):
+    """特价能量静默发货引擎：发货并更新订单状态 (失败不退款)"""
+    success = await fire_netts_silent(target_address, amount)
+    
+    # 异步另起会话更新状态，防止阻塞主循环
+    async with session_maker() as session:
+        final_status = 'SUCCESS' if success else 'FAILED_SILENT'
+        from sqlalchemy import update
+        await session.execute(
+            update(EnergyOrder).where(EnergyOrder.id == order_id).values(status=final_status)
+        )
+        await session.commit()
 
 
 # ==================== 4. 后台全自动扫块主循环 ====================
 
-# ==================== 4. 后台全自动扫块主循环 ====================
-
-# ==================== 4. 后台全自动扫块主循环 ====================
+# =====================================================================
+# 辅助核销发货函数：特价静默派发与状态流转
+# =====================================================================
+async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker):
+    """特价能量静默发货引擎：发货并更新订单状态 (失败不退款)"""
+    success = await fire_netts_silent(target_address, amount)
+    
+    # 异步另起会话更新状态，防止阻塞主循环
+    async with session_maker() as session:
+        final_status = 'SUCCESS' if success else 'FAILED_SILENT'
+        from sqlalchemy import update
+        await session.execute(
+            update(EnergyOrder).where(EnergyOrder.id == order_id).values(status=final_status)
+        )
+        await session.commit()
 
 # ==================== 4. 后台全自动扫块主循环 ====================
 
 # ==================== 4. 后台全自动扫块主循环 ====================
 
 async def run_scanner(bot, session_maker):
-    """后台扫块主循环：双轨制引擎、悲观锁防双花、自动核销分发"""
-    logging.info("🚀 [Scanner] 波场全自动双引擎扫块程序已启动...")
+    """后台扫块主循环：双轨游标阵列轮询、悲观锁防双花"""
+    logging.info("🚀 [Scanner] 波场全自动多地址阵列游标扫块引擎已启动...")
     
-    loop_count = 0  # 心跳轮询计数器
+    loop_count = 0
+    # 🧠 SRE：建立内存级游标字典 (记录每个地址上次扫到的最晚时间戳，毫秒级)
+    # 初始化为 15 分钟前，避免程序重启时重复扫描远古数据
+    init_ts = int((datetime.utcnow() - timedelta(minutes=15)).timestamp() * 1000)
+    cursor_trx = {}
+    cursor_usdt = {}
     
     while True:
         loop_count += 1
         try:
-            # 独立 Context Manager：保证每次循环结束自动归还连接，消灭 Event loop is closed
             async with session_maker() as session:
                 config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
                 sys_config = (await session.execute(config_stmt)).scalar_one_or_none()
                 
                 if not sys_config or not sys_config.master_receive_address:
-                    if loop_count % 10 == 1:
-                        logging.warning("⚠️ [Scanner] 未配置主收款地址，挂起等待中...")
                     await asyncio.sleep(10)
                     continue
                     
                 master_addr = sys_config.master_receive_address
 
+                watch_addresses = [master_addr]
+                if sys_config.global_special_address:
+                    watch_addresses.append(sys_config.global_special_address)
+                    
+                active_tenants = (await session.execute(
+                    select(Tenant).where(
+                        Tenant.is_active == True, 
+                        Tenant.has_special_energy_right == True,
+                        Tenant.special_energy_address.is_not(None)
+                    )
+                )).scalars().all()
+                
+                tenant_addr_map = {t.special_energy_address: t for t in active_tenants if t.special_energy_address}
+                watch_addresses.extend(list(tenant_addr_map.keys()))
+                watch_addresses = list(set(watch_addresses)) # 去重
+
                 if loop_count % 10 == 0:
-                    logging.info(f"💓 [Heartbeat] 扫块引擎平稳运行中，监听主地址: {master_addr[:8]}... (已轮询 {loop_count} 次)")
+                    logging.info(f"💓 [Heartbeat] 阵列雷达平稳运行，共监听 {len(watch_addresses)} 个独立地址 (已轮询 {loop_count} 次)")
 
-                # ========================================================
-                # 引擎 A：原生 TRX 进账监听 (100% 对齐 test_txid.py)
-                # ========================================================
-                trx_response = await fetch_tron_transactions(master_addr, session)
-                
-                if trx_response and "data" in trx_response:
-                    trx_txs = trx_response["data"]
-                    batch_processed_hashes = set()
+                # 🚀 核心修复：单体循环遍历所有地址，每个地址均执行 TRX + USDT 双引擎扫描！
+                for current_addr in watch_addresses:
+                    # ========================================================
+                    # 引擎 A：原生 TRX 进账滑动监听
+                    # ========================================================
+                    min_ts_trx = cursor_trx.get(current_addr, init_ts)
+                    trx_response = await fetch_tron_transactions(current_addr, session, min_ts_trx)
                     
-                    for tx in trx_txs:
-                        tx_hash = tx.get("txID")
-                        if not tx_hash or tx_hash in batch_processed_hashes:
-                            continue
+                    if trx_response and "data" in trx_response:
+                        trx_txs = trx_response["data"]
+                        batch_processed_hashes = set()
                         
-                        # 1. 严格解析波场智能合约类型
-                        contract = tx.get("raw_data", {}).get("contract", [{}])[0]
-                        if contract.get("type") != "TransferContract":
-                            continue
-
-                        # 2. 提取转账参数
-                        param = contract.get("parameter", {}).get("value", {})
-                        owner_address = param.get("owner_address")
-                        
-                        # 🛡️ 安全拦截：如果是主钱包自己往外提现转账，直接忽略防套现
-                        # (放弃 to_address 强匹配，避开 Hex 和 Base58 地址编码陷阱)
-                        if owner_address == master_addr:
-                            continue
-
-                        # 3. 精确提取 TRX 原生金额并转换精度
-                        raw_amount_sun = param.get("amount", 0)
-                        actual_trx_amount = Decimal(str(raw_amount_sun)) / Decimal("1000000")
-                        
-                        if actual_trx_amount <= 0:
-                            continue
-
-                        # 💡 强制输出重大发现探针！(证明交易已成功进入盲配区)
-                        logging.info(f"👉 [重大发现] 监听到原生TRX转账，金额: {actual_trx_amount}, TXID: {tx_hash}, 准备进入盲配逻辑...")
-
-                        # 4. 检查哈希防重放
-                        exist_tx = (await session.execute(
-                            select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash)
-                        )).scalar_one_or_none()
-                        
-                        if exist_tx:
-                            logging.info(f"   -> ⚠️ 该 TXID 之前已核销过，自动跳过。")
-                            continue
-                            
-                        batch_processed_hashes.add(tx_hash)
-
-                        # 5. 悲观锁并发防穿仓：盲配 PENDING 订单
-                        order_stmt = select(MicroDepositOrder).where(
-                            MicroDepositOrder.expected_amount == actual_trx_amount,
-                            MicroDepositOrder.status == "PENDING"
-                        ).with_for_update()
-                        
-                        matched_order = (await session.execute(order_stmt)).scalar_one_or_none()
-
-                        if matched_order:
-                            logging.info(f"   -> 🎉 【匹配成功】: 找到对应的 PENDING 充值订单 #{matched_order.id}，开始入账！")
-                            # a. 状态闭环：MicroDepositOrder 枚举为 'SUCCESS'
-                            matched_order.status = "SUCCESS"
-                            
-                            # b. 获取对应的用户和租户记录
-                            user = (await session.execute(
-                                select(User).where(User.id == matched_order.user_id).with_for_update()
-                            )).scalar_one_or_none()
-                            
-                            tenant = (await session.execute(
-                                select(Tenant).where(Tenant.id == matched_order.tenant_id).with_for_update()
-                            )).scalar_one_or_none()
-                            
-                            if user and tenant:
-                                # 智能路由：根据发起人身份判断进货本金 vs 散客余额
-                                if user.tg_user_id == tenant.owner_tg_id:
-                                    tenant.deposit_balance = tenant.deposit_balance + matched_order.expected_amount
-                                    display_balance = float(tenant.deposit_balance)
-                                    role_text = "代理本金"
-                                else:
-                                    user.balance = user.balance + matched_order.expected_amount
-                                    display_balance = float(user.balance)
-                                    role_text = "可用余额"
-                                
-                                # c. 写入 tx_hash 记录，完成防双花闭环
-                                session.add(ProcessedTx(tx_hash=tx_hash))
-                                
-                                # ⚠️ 强一致性提交事务：强制物理落盘！
-                                try:
-                                    await session.commit()
-                                    logging.info(f"✅ [Scanner] 数据库已成功持久化，核销金额: {actual_trx_amount} TRX")
-                                except Exception as db_err:
-                                    await session.rollback()
-                                    logging.error(f"❌ [Scanner] 数据库持久化失败，已回滚: {db_err}")
-                                    continue
-                                
-                                # d. 物理隔离的消息推送防崩气囊 (try-except 护体)
-                                success_msg = (
-                                    "🎉 <b>充值成功极速到账！</b>\n\n"
-                                    f"💰 <b>充值金额</b>：<code>{actual_trx_amount:g}</code> TRX\n"
-                                    f"💳 <b>当前{role_text}</b>：<code>{display_balance:g}</code> TRX\n"
-                                    f"🔗 <b>交易凭证</b>：<code>{tx_hash}</code>\n\n"
-                                    "<i>⚡ 资金已就绪，祝您使用愉快！</i>"
-                                )
-                                try:
-                                    await bot.send_message(chat_id=int(user.tg_user_id), text=success_msg, parse_mode="HTML")
-                                except Exception as notify_err:
-                                    logging.warning(f"⚠️ [Scanner] 充值通知发送失败 (TG ID: {user.tg_user_id}): {notify_err}")
-                            else:
-                                await session.rollback()
-                                logging.error(f"❌ [Scanner] 订单 #{matched_order.id} 匹配成功，但未找到用户实体，已回滚。")
-                        else:
-                            logging.info(f"   -> ❌ 【盲配失败】: 数据库中不存在金额为 {actual_trx_amount} 的 PENDING 订单。")
-
-                # ========================================================
-                # 引擎 B：USDT-TRC20 进账监听 (用于 SaaS 商铺授权) 保持不变
-                # ========================================================
-                usdt_response = await fetch_usdt_transactions(master_addr, session)
-                
-                if usdt_response and "data" in usdt_response:
-                    usdt_txs = usdt_response["data"]
-                    usdt_batch_hashes = set()
-                    
-                    for tx in usdt_txs:
-                        tx_hash = tx.get("transaction_id")
-                        if not tx_hash or tx_hash in usdt_batch_hashes:
-                            continue
-                            
-                        # 方向与假币强校验
-                        if tx.get("to") != master_addr:
-                            continue
-                        if tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS:
-                            continue
-
-                        exist_usdt_tx = (await session.execute(
-                            select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash)
-                        )).scalar_one_or_none()
-                        
-                        if exist_usdt_tx:
-                            continue
-                            
-                        usdt_batch_hashes.add(tx_hash)
-                            
-                        raw_value = tx.get("value", "0")
-                        actual_usdt = Decimal(str(raw_value)) / Decimal("1000000")
-                        if actual_usdt <= 0:
-                            continue
-                            
-                        # 悲观锁锁定 SaaS 订单
-                        saas_stmt = select(SaaSOrder).where(
-                            SaaSOrder.status == "PENDING",
-                            SaaSOrder.price == actual_usdt
-                        ).with_for_update()
-                        
-                        matched_saas = (await session.execute(saas_stmt)).scalar_one_or_none()
-                        
-                        if matched_saas:
-                            matched_saas.status = "PAID"
-                            session.add(ProcessedTx(tx_hash=tx_hash))
-                            
-                            try:
-                                await session.commit()
-                                logging.info(f"✅ [Scanner] SaaS USDT 订单核销成功！金额: {actual_usdt} U")
-                            except Exception as db_err:
-                                await session.rollback()
-                                logging.error(f"❌ [Scanner] SaaS USDT 订单持久化失败: {db_err}")
+                        # 💡 修复一：滑动窗口推进！提取这批数据中的最大时间戳，保证下次只查最新数据
+                        if trx_txs:
+                            timestamps = [tx.get("block_timestamp") for tx in trx_txs if tx.get("block_timestamp")]
+                            if timestamps:
+                                max_ts = max(timestamps)
+                                cursor_trx[current_addr] = max_ts + 1  # 游标向后推 1 毫秒，防重读
+                                logging.info(f"⏱️ [游标推进] 地址 {current_addr[:8]} 最新扫描时间戳已推进至: {max_ts}")
+    
+                        for tx in trx_txs:
+                            tx_hash = tx.get("txID")
+                            if not tx_hash or tx_hash in batch_processed_hashes:
                                 continue
                             
-                            pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
-                            success_text = (
-                                f"🎉 <b>支付成功，您的授权已到账！</b>\n\n"
-                                f"🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n"
-                                f"💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n"
-                                f"🔗 <b>交易凭证</b>：<code>{tx_hash}</code>\n\n"
-                                f"🚀 <b>下一步：请立刻前往主菜单点击对应选项，绑定 Token 或开启特权！</b>"
-                            )
+                            # 1. 拆解合约数据
+                            contract = tx.get("raw_data", {}).get("contract", [{}])[0]
+                            c_type = contract.get("type")
+                            param = contract.get("parameter", {}).get("value", {})
+                            raw_to_address = param.get("to_address", "")
+                            raw_from_address = param.get("owner_address", "")
+
+                            # 💡 核心修复：纯内置库实现 Hex 转 Base58，彻底废弃外部依赖
+                            to_address = hex_to_base58(raw_to_address)
+                            from_address = hex_to_base58(raw_from_address)
+
+                            # 🚨 探针 1：打印经过格式归一化转换后的真实地址
+                            logging.info(f"🔍 [解析调试] 扫到交易哈希: {tx_hash}, 类型: {c_type}, 到账地址: {to_address} (原Hex: {raw_to_address})")
+
+                            if c_type != "TransferContract":
+                                logging.warning(f"🚫 [拦截] 交易类型不符或非目标合约 ({c_type})")
+                                continue
+
+                            # 检查资金流向 (此时双方都已经统一为 T 开头的 Base58 格式)
+                            if str(to_address).strip() != str(current_addr).strip():
+                                logging.warning(f"🚫 [拦截] 资金流向不符 (链上: {to_address} != 正在监听: {current_addr})")
+                                continue
+                                
+                            if str(from_address).strip() == str(current_addr).strip():
+                                continue
+
+                            # 防重放查询
+                            exist_tx = (await session.execute(select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash))).scalar_one_or_none()
+                            if exist_tx:
+                                continue
+                                
+                            batch_processed_hashes.add(tx_hash)
+
+                            # 提取并转换 TRX 金额
                             try:
-                                await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
-                            except Exception as notify_err:
-                                logging.warning(f"⚠️ [Scanner] SaaS 订单通知发送失败: {notify_err}")
+                                raw_amount_sun = int(param.get("amount", 0))
+                                actual_trx_amount = Decimal(str(raw_amount_sun)) / Decimal("1000000")
+                            except Exception as e:
+                                logging.error(f"❌ [金额解析失败] TXID={tx_hash}: {e}")
+                                continue
+                                
+                            if actual_trx_amount <= 0:
+                                continue
+
+                            logging.info(f"✅ [初筛通过] 发现有效原生入账: TXID={tx_hash}, 金额={actual_trx_amount} TRX, 准备分流...")
+
+                            # ===================== 分流 1：主钱包微小尾数充值盲配 =====================
+                            if current_addr == master_addr:
+                                order_stmt = select(MicroDepositOrder).where(
+                                    MicroDepositOrder.expected_amount == actual_trx_amount,
+                                    MicroDepositOrder.status == "PENDING"
+                                ).order_by(MicroDepositOrder.created_at.asc()).with_for_update()
+                                
+                                matched_orders = (await session.execute(order_stmt)).scalars().all()
+                                
+                                if matched_orders:
+                                    matched_order = matched_orders[0]
+                                    matched_order.status = "SUCCESS"
+                                    
+                                    user = (await session.execute(select(User).where(User.id == matched_order.user_id).with_for_update())).scalar_one_or_none()
+                                    tenant = (await session.execute(select(Tenant).where(Tenant.id == matched_order.tenant_id).with_for_update())).scalar_one_or_none()
+                                    
+                                    if user and tenant:
+                                        if user.tg_user_id == tenant.owner_tg_id:
+                                            tenant.deposit_balance = tenant.deposit_balance + matched_order.expected_amount
+                                            role_text = "代理本金"
+                                            display_balance = float(tenant.deposit_balance)
+                                        else:
+                                            user.balance = user.balance + matched_order.expected_amount
+                                            role_text = "可用余额"
+                                            display_balance = float(user.balance)
+                                        
+                                        await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                        
+                                        try:
+                                            await session.commit()
+                                            success_msg = (
+                                                f"🎉 <b>充值成功极速到账！</b>\n\n"
+                                                f"💰 <b>充值金额</b>：<code>{actual_trx_amount:g}</code> TRX\n"
+                                                f"💳 <b>当前{role_text}</b>：<code>{display_balance:g}</code> TRX\n"
+                                                f"🔗 <b>交易凭证</b>：<code>{tx_hash}</code>"
+                                            )
+                                            try:
+                                                await bot.send_message(chat_id=int(user.tg_user_id), text=success_msg, parse_mode="HTML")
+                                            except Exception:
+                                                pass
+                                        except Exception as db_err:
+                                            await session.rollback()
+                                            logging.error(f"❌ 充值持久化失败: {db_err}")
+                                            continue
+                                    else:
+                                        await session.rollback()
+                                else:
+                                    logging.warning(f"🚫 [拦截] 充值盲配失败: 未找到金额为 {actual_trx_amount} 的 PENDING 订单。")
+                                    await session.rollback()
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    await session.commit()
+
+                            # ===================== 分流 2：租户专属特价静默直转 =====================
+                            elif current_addr in tenant_addr_map:
+                                tenant_info = tenant_addr_map[current_addr]
+                                tenant = (await session.execute(
+                                    select(Tenant).where(Tenant.id == tenant_info.id).with_for_update()
+                                )).scalar_one_or_none()
+                                
+                                if tenant and tenant.is_active and not tenant.is_banned:
+                                    float_actual = float(actual_trx_amount)
+                                    float_65k = float(tenant.special_price_65k or 0)
+                                    float_131k = float(tenant.special_price_131k or 0)
+                                    
+                                    order_type = None
+                                    energy_amount = 0
+                                    
+                                    if float_65k > 0 and float_actual == float_65k:
+                                        order_type = 'DIRECT_SPECIAL_65K'
+                                        energy_amount = 65000
+                                    elif float_131k > 0 and float_actual == float_131k:
+                                        order_type = 'DIRECT_SPECIAL_131K'
+                                        energy_amount = 131000
+                                        
+                                    if order_type:
+                                        netts_cost = Decimal(str(sys_config.netts_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.netts_cost_131k))
+                                        draw_cost = Decimal(str(sys_config.base_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.base_cost_131k))
+                                        deduction_cost = netts_cost + draw_cost
+                                        
+                                        if deduction_cost > 0 and tenant.deposit_balance >= deduction_cost:
+                                            tenant.deposit_balance = tenant.deposit_balance - deduction_cost
+                                            
+                                            new_order = EnergyOrder(
+                                                tenant_id=tenant.id,
+                                                order_type=order_type,
+                                                target_address=from_address,
+                                                admin_base_cost=deduction_cost,
+                                                tenant_markup=Decimal(str(actual_trx_amount)) - deduction_cost,
+                                                total_user_deducted=actual_trx_amount,
+                                                status='PROCESSING'
+                                            )
+                                            session.add(new_order)
+                                            await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                            
+                                            try:
+                                                await session.commit()
+                                                await session.refresh(new_order)
+                                                logging.info(f"🎉 [特价派发] 代理本金暗扣成功！已拉起 Netts 发货任务。")
+                                                asyncio.create_task(dispatch_special_energy(from_address, energy_amount, new_order.id, session_maker))
+                                            except Exception as e:
+                                                await session.rollback()
+                                                logging.error(f"❌ 订单生成失败: {e}")
+                                        else:
+                                            logging.warning(f"🚫 [拦截] 代理本金不足以扣除成本 {deduction_cost} TRX，已拒绝静默派发。")
+                                            await session.rollback()
+                                            await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                            await session.commit()
+                                    else:
+                                        logging.warning(f"🚫 [拦截] 金额不匹配 (链上: {float_actual} TRX, 期望特价 65K:{float_65k}, 131K:{float_131k})。")
+                                        await session.rollback()
+                                        await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                        await session.commit()
+                                else:
+                                    logging.warning(f"🚫 [拦截] 未找到对应收款代理商(或已被封禁)！")
+                                    await session.rollback()
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    await session.commit()
+
+
+                    # ========================================================
+                    # 引擎 B：USDT-TRC20 进账滑动监听 (💡 性能优化：仅查主钱包)
+                    # ========================================================
+                    if current_addr == master_addr:
+                        min_ts_usdt = cursor_usdt.get(master_addr, init_ts)
+                        usdt_response = await fetch_usdt_transactions(master_addr, session, min_ts_usdt)
+                        
+                        if usdt_response and "data" in usdt_response:
+                            usdt_txs = usdt_response["data"]
+                            usdt_batch_hashes = set()
+                            
+                            if usdt_txs:
+                                max_ts = max([tx.get("block_timestamp", min_ts_usdt) for tx in usdt_txs])
+                                cursor_usdt[master_addr] = max_ts + 1
+                            
+                            for tx in usdt_txs:
+                                tx_hash = tx.get("transaction_id")
+                                if not tx_hash or tx_hash in usdt_batch_hashes: continue
+                                
+                                # 防出账与假币过滤
+                                if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
+                                    continue
+
+                                exist_usdt_tx = (await session.execute(select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash))).scalar_one_or_none()
+                                if exist_usdt_tx: continue
+                                    
+                                usdt_batch_hashes.add(tx_hash)
+                                actual_usdt = Decimal(str(tx.get("value", "0"))) / Decimal("1000000")
+                                if actual_usdt <= 0: continue
+                                
+                                logging.info(f"🔍 [追踪-1/5] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}, 类型=USDT, 收款方={master_addr}")
+                                
+                                # SaaS 订单盲配
+                                saas_stmt = select(SaaSOrder).where(
+                                    SaaSOrder.status == "PENDING", 
+                                    SaaSOrder.price == actual_usdt
+                                ).order_by(SaaSOrder.created_at.asc()).with_for_update()
+                                
+                                matched_saas_list = (await session.execute(saas_stmt)).scalars().all()
+                                
+                                if matched_saas_list:
+                                    if len(matched_saas_list) > 1:
+                                        logging.warning(f"⚠️ [防撞击警告] USDT 金额 {actual_usdt} 存在多笔 PENDING，匹配订单 #{matched_saas_list[0].id}。")
+                                    matched_saas = matched_saas_list[0]
+                                    matched_saas.status = "PAID"
+                                    
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    try:
+                                        await session.commit()
+                                        pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
+                                        success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻前往主菜单点击对应选项，绑定 Token 或开启特权！</b>"
+                                        try: await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
+                                        except Exception: pass
+                                    except Exception as db_err: 
+                                        await session.rollback()
+                                        logging.error(f"❌ [Scanner] SaaS USDT 持久化失败: {db_err}")
+                                else:
+                                    # 吞噬无效的无关 USDT 转账
+                                    await session.rollback()
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    await session.commit()
+
+                    # 阵列防封避退：每个地址查询之间休眠 0.2 秒
+                    await asyncio.sleep(0.2)
 
         except Exception as e:
             logging.error(f"❌ [Scanner] 扫块循环发生严重异常: {e}", exc_info=True)
             
         await asyncio.sleep(6)
-
 # =====================================================================
 # 🚀 独立守护进程点火开关 (Standalone Entry Point)
 # =====================================================================
