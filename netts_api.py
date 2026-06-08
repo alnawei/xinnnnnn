@@ -26,10 +26,10 @@ async def get_netts_pricing() -> dict:
         return None
 
 
-async def fire_netts_silent(address: str, amount: int) -> bool:
+async def fire_netts_silent(address: str, amount: int, duration: str = "1H") -> bool:
     """
     🚨 静默发货引擎 (供 tron_scanner.py 扫块底层使用) 
-    作为 SaaS 底层，无论发货成功与否，绝不抛出任何 Exception 阻断扫块中枢的主循环。
+    新增 duration 参数，动态控制 1H 或 5M 时效。
     """
     import json
     headers = {
@@ -39,7 +39,8 @@ async def fire_netts_silent(address: str, amount: int) -> bool:
     }
     payload = {
         "address": address,
-        "amount": amount
+        "amount": amount,
+        "period": duration.upper()  # 自动转大写，适配上游的 '1H' 或 '5M'
     }
     try:
         async with aiohttp.ClientSession() as session:
