@@ -1,10 +1,9 @@
 # models.py
 from datetime import datetime
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, DateTime, Enum, ForeignKey, Text
 from config import DATABASE_URL
-
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
 # ==================== 初始化数据库连接与会话池 ====================
 # 这里就是 AsyncSessionLocal 的定义位置，供全局调用
 # 🛡️ SRE 加固：扩容高并发连接池，开启 pool_pre_ping 防断联假死
@@ -14,10 +13,12 @@ engine = create_async_engine(
     max_overflow=200,          # 流量洪峰时最大允许 200 个溢出连接
     pool_timeout=30,           # 获取连接的最高等待时间
     pool_pre_ping=True,        # 每次使用前 Ping 一下 MySQL，断线自动重连！
-    pool_recycle=1800,         # 连接存活期缩短至半小时，防服务端强制掐断
+    pool_recycle=1800,         # 连接存活期缩短至半小时，防服务端强制断开
     echo=False
 )
-AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+# 🛡️ 核心修复：使用 async_sessionmaker 替代旧版的 sessionmaker，彻底消除 MissingGreenlet 懒加载冲突
+AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 # ==================== 1. 系统全局配置表 ====================
