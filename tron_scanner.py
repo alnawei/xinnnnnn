@@ -116,15 +116,52 @@ async def handle_balance_purchase(
             await session.commit()
             await send_tg_message(user_id, "❌ <b>能量派发失败</b>\n\n上游网络波动或库存不足，派发中断。<b>扣除的 TRX 已全额安全退回至您的账户</b>，请稍后重试！")
 
+# =====================================================================
+# 辅助核销发货函数：特价静默派发与状态流转（带失败自动退款防线）
+# =====================================================================
 async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker):
-    """【特价能量静默发货引擎】：扫块底层使用，发货并更新订单状态 (失败不退款)"""
+    """特价能量静默发货引擎：发货、更新订单状态，失败必须退回代理本金！"""
+    # 1. 尝试真实发货
     success = await fire_netts_silent(target_address, amount)
+    
+    # 2. 异步另起会话处理财务状态，防止阻塞主循环
     async with session_maker() as session:
-        final_status = 'SUCCESS' if success else 'FAILED_SILENT'
-        await session.execute(
-            update(EnergyOrder).where(EnergyOrder.id == order_id).values(status=final_status)
-        )
-        await session.commit()
+        try:
+            # 开启排他锁查询该笔能量订单
+            order = (await session.execute(
+                select(EnergyOrder).where(EnergyOrder.id == order_id).with_for_update()
+            )).scalar_one_or_none()
+            
+            if not order:
+                logging.error(f"❌ [发货回执] 致命异常：找不到订单 #{order_id}，无法更新状态或退款！")
+                return
+
+            if success:
+                order.status = 'SUCCESS'
+                await session.commit()
+                logging.info(f"🎉 [发货回执] 订单 #{order_id} 能量下发成功，资金流转闭环完成！")
+            else:
+                logging.warning(f"⚠️ [发货回执] 订单 #{order_id} 发货失败，立即启动代理商本金退款程序...")
+                order.status = 'FAILED_REFUNDED'
+                
+                # 获取对应的租户，加排他锁防并发
+                tenant = (await session.execute(
+                    select(Tenant).where(Tenant.id == order.tenant_id).with_for_update()
+                )).scalar_one_or_none()
+                
+                if tenant:
+                    # 💡 核心财务修复：将当时扣除的进货底价成本，原分不动地加回代理商的 deposit_balance
+                    refund_amount = order.admin_base_cost
+                    tenant.deposit_balance = tenant.deposit_balance + refund_amount
+                    logging.info(f"✅ [发货回执] 退款成功！已向租户 #{tenant.id} 的进货本金池退回 {refund_amount} TRX。")
+                else:
+                    logging.error(f"❌ [发货回执] 找不到租户 #{order.tenant_id}，退款失败，发生死账！")
+                    
+                await session.commit()
+                
+        except Exception as e:
+            await session.rollback()
+            logging.error(f"❌ [发货回执] 状态流转或退款落盘发生严重异常: {e}", exc_info=True)
 
 # ==================== 3. 动态节点池与链上数据请求 ====================
 
