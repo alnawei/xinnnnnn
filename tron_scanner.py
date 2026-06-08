@@ -251,7 +251,6 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession, min_times
                     await session.commit()
                 continue
     return {"data": [], "success": False}
-# ==================== 4. 后台全自动扫块主循环 ====================
 # =====================================================================
 # 辅助核销发货函数：特价静默派发与状态流转
 # =====================================================================
@@ -262,6 +261,7 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
     # 异步另起会话更新状态，防止阻塞主循环
     async with session_maker() as session:
         final_status = 'SUCCESS' if success else 'FAILED_SILENT'
+        from sqlalchemy import update
         await session.execute(
             update(EnergyOrder).where(EnergyOrder.id == order_id).values(status=final_status)
         )
@@ -284,9 +284,6 @@ async def run_scanner(bot, session_maker):
     while True:
         loop_count += 1
         try:
-            # 动态计算 2 分钟前的兜底时间戳，防止开机扫描远古数据瀑布流
-            fallback_ts = int((datetime.utcnow() - timedelta(minutes=2)).timestamp() * 1000)
-
             async with session_maker() as session:
                 config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
                 sys_config = (await session.execute(config_stmt)).scalar_one_or_none()
@@ -322,15 +319,14 @@ async def run_scanner(bot, session_maker):
                 # 引擎 A：原生 TRX 进账全局滑动监听
                 # ========================================================
                 for current_addr in watch_addresses:
-                    min_ts_trx = GLOBAL_CURSOR_TRX.get(current_addr, fallback_ts)
-                    trx_response = await fetch_tron_transactions(current_addr, session, min_ts_trx)
+                    # 1. 提取全局游标记忆 (无记录则默认为0，绝不受系统时间干扰)
+                    current_cursor = GLOBAL_CURSOR_TRX.get(current_addr, 0)
+                    trx_response = await fetch_tron_transactions(current_addr, session, current_cursor)
                     
                     if trx_response and "data" in trx_response:
                         trx_txs = trx_response["data"]
                         batch_processed_hashes = set()
-                        
-                        # 💡 游标初始化：继承上一轮时间戳
-                        max_ts_in_batch = min_ts_trx
+                        max_ts_in_batch = 0
     
                         for tx in trx_txs:
                             tx_hash = tx.get("txID")
@@ -339,12 +335,12 @@ async def run_scanner(bot, session_maker):
                             
                             block_ts = tx.get("block_timestamp", 0)
                             
-                            # 1️⃣ 绝对第一优先级：无条件提取最大时间戳，推动游标！
+                            # 1️⃣ 绝对第一优先级：无论这笔交易要不要，先把它的时间戳记录下来推动游标！
                             if block_ts > max_ts_in_batch:
                                 max_ts_in_batch = block_ts
                                 
-                            # 2️⃣ 第二优先级：内存级静默拦截（低于当前游标直接无声跳过）
-                            if block_ts < min_ts_trx:
+                            # 2️⃣ 🔇 终极绝对静默防线（小于等于全局游标，直接哑巴跳过！）
+                            if current_cursor > 0 and block_ts <= current_cursor:
                                 continue
                                 
                             # 3️⃣ 第三优先级：超时拦截（打印黄色警告，不查库不写库，直接丢弃）
@@ -358,42 +354,11 @@ async def run_scanner(bot, session_maker):
                             c_type = contract.get("type")
                             param = contract.get("parameter", {}).get("value", {})
                             
-                            to_address = hex_to_base58(param.get("to_address", ""))
-                            from_address = hex_to_base58(param.get("owner_address", ""))
+                            raw_to_address = param.get("to_address", "")
+                            raw_from_address = param.get("owner_address", "")
 
-                            logging.info(f"🔍 [解析调试] 扫到交易哈希: {tx_hash}, 类型: {c_type}, 到账地址: {to_address}")
-                            
-                            # ... （下方保留原有的 if c_type != "TransferContract": 及后续盲配业务代码） ...
-
-                        # 💡 循环结束后：强制更新下一轮请求的游标 (+1 毫秒，彻底跨过这批老数据)
-                        if max_ts_in_batch >= min_ts_trx:
-                            GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch + 1
-                            logging.info(f"⏱️ [游标推进-TRX] 地址 {current_addr[:8]} 最新扫描时间戳已推至: {max_ts_in_batch + 1}")
-    
-                        for tx in trx_txs:
-                            tx_hash = tx.get("txID")
-                            block_ts = tx.get("block_timestamp", 0)
-                            
-                            if not tx_hash or tx_hash in batch_processed_hashes:
-                                continue
-                                
-                            # 🛡️ 内存级防刷屏拦截：波场 API 若返回旧数据，Python 层物理静默丢弃！
-                            if block_ts < min_ts_trx:
-                                continue
-                                
-                            # 🛡️ 超时风控拦截：超过 60 秒的死单直接丢弃
-                            current_ts_ms = int(time.time() * 1000)
-                            if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
-                                logging.warning(f"🚫 [拦截] 订单已超时丢弃 (距今已超60秒)。TXID: {tx_hash}")
-                                continue
-
-                            # 拆解合约数据
-                            contract = tx.get("raw_data", {}).get("contract", [{}])[0]
-                            c_type = contract.get("type")
-                            param = contract.get("parameter", {}).get("value", {})
-                            
-                            to_address = hex_to_base58(param.get("to_address", ""))
-                            from_address = hex_to_base58(param.get("owner_address", ""))
+                            to_address = hex_to_base58(raw_to_address)
+                            from_address = hex_to_base58(raw_from_address)
 
                             logging.info(f"🔍 [解析调试] 扫到交易哈希: {tx_hash}, 类型: {c_type}, 到账地址: {to_address}")
 
@@ -420,7 +385,7 @@ async def run_scanner(bot, session_maker):
 
                             logging.info(f"✅ [初筛通过] 发现有效原生入账: TXID={tx_hash}, 金额={actual_trx_amount} TRX, 准备分流...")
 
-                            # 🔀 业务分流 1：主钱包微小尾数充值盲配
+                            # 🔀 分流 1：主钱包微小尾数充值盲配
                             if current_addr == master_addr:
                                 order_stmt = select(MicroDepositOrder).where(
                                     MicroDepositOrder.expected_amount == actual_trx_amount,
@@ -430,6 +395,8 @@ async def run_scanner(bot, session_maker):
                                 matched_orders = (await session.execute(order_stmt)).scalars().all()
                                 
                                 if matched_orders:
+                                    if len(matched_orders) > 1:
+                                        logging.warning(f"⚠️ [防撞击警告] 监听到金额 {actual_trx_amount} 存在多笔并发 PENDING 订单！将自动匹配最早的订单 #{matched_orders[0].id}。")
                                     matched_order = matched_orders[0]
                                     matched_order.status = "SUCCESS"
                                     
@@ -460,9 +427,11 @@ async def run_scanner(bot, session_maker):
                                     logging.warning(f"🚫 [拦截] 充值盲配失败: 未找到金额为 {actual_trx_amount} 的 PENDING 订单。")
                                     await session.rollback()
 
-                            # 🔀 业务分流 2：租户专属特价静默直转
+                            # 🔀 分流 2：租户专属特价静默直转
                             elif current_addr in tenant_addr_map:
                                 target_tenant_id = tenant_addr_map[current_addr]
+                                logging.info(f"🔄 [追踪-2/5] 匹配为租户 #{target_tenant_id} 的特价收款，准备盲配...")
+                                
                                 tenant = (await session.execute(
                                     select(Tenant).where(Tenant.id == target_tenant_id).with_for_update()
                                 )).scalar_one_or_none()
@@ -514,113 +483,102 @@ async def run_scanner(bot, session_maker):
                                         logging.warning(f"🚫 [拦截] 金额 {float_actual} TRX 与特价档位不符。")
                                         await session.rollback()
                                 else:
+                                    logging.warning(f"🚫 [拦截] 未找到对应收款代理商(或已被封禁)！")
                                     await session.rollback()
+
+                        # 💡 循环结束后，更新全局字典！
+                        if max_ts_in_batch > current_cursor:
+                            GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
+                            logging.info(f"⏱️ [游标推进-TRX] 地址 {current_addr[:8]} 最新扫描时间戳已推至: {max_ts_in_batch}")
+
+                    # ========================================================
+                    # 引擎 B：USDT-TRC20 进账滑动监听 (仅查主钱包)
+                    # ========================================================
+                    if current_addr == master_addr:
+                        # 1. 提取全局游标记忆
+                        current_cursor_usdt = GLOBAL_CURSOR_USDT.get(master_addr, 0)
+                        usdt_response = await fetch_usdt_transactions(master_addr, session, current_cursor_usdt)
+                        
+                        if usdt_response and "data" in usdt_response:
+                            usdt_txs = usdt_response["data"]
+                            usdt_batch_hashes = set()
+                            max_ts_usdt_batch = 0
+                            
+                            for tx in usdt_txs:
+                                tx_hash = tx.get("transaction_id")
+                                if not tx_hash or tx_hash in usdt_batch_hashes: 
+                                    continue
+                                
+                                block_ts = tx.get("block_timestamp", 0)
+                                
+                                # 1️⃣ 绝对第一优先级：提取最大时间戳
+                                if block_ts > max_ts_usdt_batch:
+                                    max_ts_usdt_batch = block_ts
                                     
-                    await asyncio.sleep(0.3)
+                                # 2️⃣ 🔇 终极绝对静默防线（小于等于游标，直接跳过）
+                                if current_cursor_usdt > 0 and block_ts <= current_cursor_usdt:
+                                    continue
+                                    
+                                # 3️⃣ 超时废单拦截
+                                current_ts_ms = int(time.time() * 1000)
+                                if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
+                                    logging.warning(f"🚫 [拦截] USDT 订单已超时丢弃 (距今已超60秒)！TXID: {tx_hash}")
+                                    continue
+                                    
+                                # 4️⃣ 下方为正常业务验证逻辑
+                                if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
+                                    continue
 
-                # ========================================================
-                # 引擎 B：USDT-TRC20 进账滑动监听 (仅查主钱包)
-                # ========================================================
-                if current_addr == master_addr:
-                    min_ts_usdt = GLOBAL_CURSOR_USDT.get(master_addr, fallback_ts)
-                    usdt_response = await fetch_usdt_transactions(master_addr, session, min_ts_usdt)
-                    
-                    if usdt_response and "data" in usdt_response:
-                        usdt_txs = usdt_response["data"]
-                        usdt_batch_hashes = set()
-                        
-                        # 💡 游标初始化
-                        max_ts_usdt_batch = min_ts_usdt
-                        
-                        for tx in usdt_txs:
-                            tx_hash = tx.get("transaction_id")
-                            if not tx_hash or tx_hash in usdt_batch_hashes: 
-                                continue
-                            
-                            block_ts = tx.get("block_timestamp", 0)
-                            
-                            # 1️⃣ 绝对优先：提取最大时间戳
-                            if block_ts > max_ts_usdt_batch:
-                                max_ts_usdt_batch = block_ts
+                                exist_usdt_tx = (await session.execute(select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash))).scalar_one_or_none()
+                                if exist_usdt_tx: 
+                                    continue
+                                    
+                                usdt_batch_hashes.add(tx_hash)
+                                actual_usdt = Decimal(str(tx.get("value", "0"))) / Decimal("1000000")
+                                if actual_usdt <= 0: 
+                                    continue
                                 
-                            # 2️⃣ 内存静默拦截
-                            if block_ts < min_ts_usdt:
-                                continue
+                                logging.info(f"🔍 [追踪-USDT] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}, 类型=USDT, 收款方={master_addr}")
                                 
-                            # 3️⃣ 超时废单拦截
-                            current_ts_ms = int(time.time() * 1000)
-                            if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
-                                logging.warning(f"🚫 [拦截] USDT 订单已超时丢弃 (距今已超60秒)！TXID: {tx_hash}")
-                                continue
+                                saas_stmt = select(SaaSOrder).where(
+                                    SaaSOrder.status == "PENDING", 
+                                    SaaSOrder.price == actual_usdt
+                                ).order_by(SaaSOrder.created_at.asc()).with_for_update()
                                 
-                            # 4️⃣ 下方为业务验证逻辑
-                            if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
-                                continue
+                                matched_saas_list = (await session.execute(saas_stmt)).scalars().all()
+                                
+                                if matched_saas_list:
+                                    if len(matched_saas_list) > 1:
+                                        logging.warning(f"⚠️ [防撞击警告] USDT 金额 {actual_usdt} 存在多笔 PENDING，匹配订单 #{matched_saas_list[0].id}。")
+                                    matched_saas = matched_saas_list[0]
+                                    matched_saas.status = "PAID"
+                                    
+                                    await session.merge(ProcessedTx(tx_hash=tx_hash))
+                                    try:
+                                        await session.commit()
+                                        pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
+                                        success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻前往主菜单点击对应选项，绑定 Token 或开启特权！</b>"
+                                        try: await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
+                                        except Exception: pass
+                                    except Exception as db_err: 
+                                        await session.rollback()
+                                        logging.error(f"❌ [Scanner] SaaS USDT 持久化失败: {db_err}")
+                                else:
+                                    logging.warning(f"🚫 [拦截] 未找到金额为 {actual_usdt} USDT 的 PENDING 订单。")
+                                    await session.rollback()
 
-                            # ... （下方保留原有的 exist_usdt_tx 查询 及后续业务代码） ...
-                            
-                        # 💡 循环结束后：更新 USDT 游标
-                        if max_ts_usdt_batch >= min_ts_usdt:
-                            GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch + 1
-                            logging.info(f"⏱️ [游标推进-USDT] 主钱包时间戳已推至: {max_ts_usdt_batch + 1}")
-                    
-                    for tx in usdt_txs:
-                        tx_hash = tx.get("transaction_id")
-                        block_ts = tx.get("block_timestamp", 0)
-                        
-                        if not tx_hash or tx_hash in usdt_batch_hashes: 
-                            continue
-                            
-                        # 🛡️ 内存级防刷屏拦截
-                        if block_ts < min_ts_usdt:
-                            continue
-                            
-                        # 🛡️ USDT 1分钟超时拦截
-                        current_ts_ms = int(time.time() * 1000)
-                        if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
-                            logging.warning(f"🚫 [拦截] USDT 订单已超时丢弃 (距今已超60秒)！TXID: {tx_hash}")
-                            continue
-                        
-                        if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
-                            continue
+                            # 💡 循环结束后，更新全局字典！
+                            if max_ts_usdt_batch > current_cursor_usdt:
+                                GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
+                                logging.info(f"⏱️ [游标推进-USDT] 主钱包时间戳已推至: {max_ts_usdt_batch}")
 
-                        exist_usdt_tx = (await session.execute(select(ProcessedTx).where(ProcessedTx.tx_hash == tx_hash))).scalar_one_or_none()
-                        if exist_usdt_tx: continue
-                            
-                        usdt_batch_hashes.add(tx_hash)
-                        actual_usdt = Decimal(str(tx.get("value", "0"))) / Decimal("1000000")
-                        if actual_usdt <= 0: continue
-                        
-                        logging.info(f"🔍 [追踪-1/5] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}, 类型=USDT, 收款方={master_addr}")
-                        
-                        saas_stmt = select(SaaSOrder).where(
-                            SaaSOrder.status == "PENDING", 
-                            SaaSOrder.price == actual_usdt
-                        ).order_by(SaaSOrder.created_at.asc()).with_for_update()
-                        
-                        matched_saas_list = (await session.execute(saas_stmt)).scalars().all()
-                        
-                        if matched_saas_list:
-                            matched_saas = matched_saas_list[0]
-                            matched_saas.status = "PAID"
-                            await session.merge(ProcessedTx(tx_hash=tx_hash))
-                            try:
-                                await session.commit()
-                                pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
-                                success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻前往主菜单点击对应选项，绑定 Token 或开启特权！</b>"
-                                try: await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
-                                except Exception: pass
-                            except Exception as db_err: 
-                                await session.rollback()
-                                logging.error(f"❌ [Scanner] SaaS USDT 持久化失败: {db_err}")
-                        else:
-                            await session.rollback()
+                    # 阵列防封避退：每个地址查询之间休眠 0.2 秒
+                    await asyncio.sleep(0.2)
 
         except Exception as e:
             logging.error(f"❌ [Scanner] 扫块循环发生严重异常: {e}", exc_info=True)
             
         await asyncio.sleep(6)
-
 # =====================================================================
 # 🚀 独立守护进程点火开关 (Standalone Entry Point)
 # =====================================================================
