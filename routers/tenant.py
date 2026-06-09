@@ -183,11 +183,23 @@ async def process_tenant_deposit_amount(message: Message, current_tenant: Tenant
         if not final_amount:
             return await wait_msg.edit_text("❌ 当前充值通道极其繁忙，请稍后或更换金额重试。")
 
-        # 查询代理老板自己的散客 User ID（维持外键关联一致性）
+        # 查询或创建代理老板自己的散客 User ID，避免写出 user_id=0 的不可核销死单。
         user_record = await session.scalar(
             select(User).where(User.tenant_id == current_tenant.id, User.tg_user_id == message.from_user.id)
         )
-        user_id_val = user_record.id if user_record else 0
+        if not user_record:
+            user_record = User(
+                tenant_id=current_tenant.id,
+                tg_user_id=message.from_user.id,
+                tg_first_name=message.from_user.first_name or "Unknown",
+                balance=Decimal("0.00"),
+                total_orders=0,
+                total_spent_trx=Decimal("0.00")
+            )
+            session.add(user_record)
+            await session.flush()
+
+        user_id_val = user_record.id
         fractional_val = final_amount - Decimal(str(base_amount))
 
         # 将订单写入数据库锁定尾数
@@ -753,13 +765,14 @@ async def tenant_renew_pkg_callback(call: CallbackQuery, session: AsyncSession):
             SaaSOrder.created_at >= valid_time_limit
         )
         occupied_prices_scalars = await session.scalars(stmt)
-        occupied_prices = set(round(float(p), 2) for p in occupied_prices_scalars.all())
-        
-        final_price_float = float(base_price)
-        while round(final_price_float, 2) in occupied_prices:
-            final_price_float += 0.01
-        
-        final_price = Decimal(str(round(final_price_float, 2)))
+        occupied_prices = {
+            Decimal(str(p)).quantize(Decimal("0.01"))
+            for p in occupied_prices_scalars.all()
+        }
+
+        final_price = base_price.quantize(Decimal("0.01"))
+        while final_price in occupied_prices:
+            final_price += Decimal("0.01")
 
         # 入库 (order_type 设为 clone，配合 /test_pay 走老客户时间累加逻辑)
         new_order = SaaSOrder(
@@ -970,13 +983,14 @@ async def tenant_buy_plugin_callback(call: CallbackQuery, session: AsyncSession)
             SaaSOrder.created_at >= valid_time_limit
         )
         occupied_prices_scalars = await session.scalars(stmt)
-        occupied_prices = set(round(float(p), 2) for p in occupied_prices_scalars.all())
-        
-        final_price_float = float(base_price)
-        while round(final_price_float, 2) in occupied_prices:
-            final_price_float += 0.01
-        
-        final_price = Decimal(str(round(final_price_float, 2)))
+        occupied_prices = {
+            Decimal(str(p)).quantize(Decimal("0.01"))
+            for p in occupied_prices_scalars.all()
+        }
+
+        final_price = base_price.quantize(Decimal("0.01"))
+        while final_price in occupied_prices:
+            final_price += Decimal("0.01")
 
         # 入库 (order_type 设为 special)
         new_order = SaaSOrder(

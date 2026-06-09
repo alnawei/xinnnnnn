@@ -1002,12 +1002,26 @@ def get_user_router() -> Router:
             except Exception as dispatch_err:
                 # 🚨 触发核心退款回滚机制（此时钱已被扣除，必须安全加回去）
                 await session.rollback()  # 确保清理掉未提交的脏状态
-                
-                # 状态流转为大写的退款失败状态
-                new_order.status = 'FAILED_REFUNDED'
-                
+
+                locked_order = await session.scalar(
+                    select(EnergyOrder).where(
+                        EnergyOrder.id == new_order.id,
+                        EnergyOrder.status == 'PROCESSING'
+                    ).with_for_update()
+                )
+                if not locked_order:
+                    await call.message.edit_text(
+                        "⚠️ <b>订单状态已经被处理，请勿重复操作。</b>",
+                        parse_mode="HTML"
+                    )
+                    return
+
+                locked_order.status = 'FAILED_REFUNDED'
+
                 # 重新拉取用户记录，防止并发导致的覆盖写
-                refund_user = await session.get(User, user.id)
+                refund_user = await session.scalar(
+                    select(User).where(User.id == user.id).with_for_update()
+                )
                 if refund_user:
                     # 完美原路退回资金，并抹除这笔失败的消费统计
                     refund_user.balance = refund_user.balance + price
@@ -1427,12 +1441,11 @@ def get_user_router() -> Router:
             test_fractional = Decimal(tail_str)
             test_expected = Decimal(str(base_amount)) + test_fractional
             
-            # 全局排重：查找当前租户下，是否有未过期且金额完全一致的待支付订单
+            # 扫块核销按金额全局匹配，因此这里也必须全局排重，避免跨租户串单。
             stmt = select(MicroDepositOrder).where(
                 MicroDepositOrder.expected_amount == test_expected,
                 MicroDepositOrder.status == "PENDING",
-                MicroDepositOrder.expired_at > now_time,
-                MicroDepositOrder.tenant_id == current_tenant.id
+                MicroDepositOrder.expired_at > now_time
             )
             existing = (await session.execute(stmt)).scalar_one_or_none()
             
@@ -1456,8 +1469,7 @@ def get_user_router() -> Router:
                 stmt = select(MicroDepositOrder).where(
                     MicroDepositOrder.expected_amount == test_expected,
                     MicroDepositOrder.status == "PENDING",
-                    MicroDepositOrder.expired_at > now_time,
-                    MicroDepositOrder.tenant_id == current_tenant.id
+                    MicroDepositOrder.expired_at > now_time
                 )
                 existing = (await session.execute(stmt)).scalar_one_or_none()
                 
