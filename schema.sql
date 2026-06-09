@@ -126,7 +126,8 @@ CREATE TABLE `micro_deposit_orders` (
   `expired_at` datetime NOT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_micro_deposit_status_amount` (`status`,`expected_amount`),
-  KEY `idx_micro_deposit_expired_at` (`expired_at`)
+  KEY `idx_micro_deposit_expired_at` (`expired_at`),
+  KEY `idx_micro_deposit_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `withdraw_orders` (
@@ -140,7 +141,8 @@ CREATE TABLE `withdraw_orders` (
   `created_at` datetime DEFAULT NULL,
   `handled_at` datetime DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_withdraw_status` (`status`)
+  KEY `idx_withdraw_status` (`status`),
+  KEY `idx_withdraw_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `energy_orders` (
@@ -169,6 +171,32 @@ CREATE TABLE `processed_txs` (
   KEY `idx_processed_txs_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+CREATE TABLE `financial_daily_summaries` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `summary_date` date NOT NULL,
+  `tenant_id` int(11) NOT NULL DEFAULT 0,
+  `deposit_success_count` int(11) DEFAULT 0,
+  `deposit_trx` decimal(18,6) DEFAULT 0.000000,
+  `energy_success_count` int(11) DEFAULT 0,
+  `energy_refund_count` int(11) DEFAULT 0,
+  `energy_failed_count` int(11) DEFAULT 0,
+  `energy_user_paid_trx` decimal(18,6) DEFAULT 0.000000,
+  `energy_refund_trx` decimal(18,6) DEFAULT 0.000000,
+  `admin_cost_trx` decimal(18,6) DEFAULT 0.000000,
+  `tenant_profit_trx` decimal(18,6) DEFAULT 0.000000,
+  `withdraw_paid_count` int(11) DEFAULT 0,
+  `withdraw_paid_trx` decimal(18,6) DEFAULT 0.000000,
+  `withdraw_rejected_count` int(11) DEFAULT 0,
+  `withdraw_rejected_trx` decimal(18,6) DEFAULT 0.000000,
+  `saas_paid_count` int(11) DEFAULT 0,
+  `saas_paid_usdt` decimal(18,6) DEFAULT 0.000000,
+  `created_at` datetime DEFAULT NULL,
+  `updated_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_financial_daily_summary_date_tenant` (`summary_date`,`tenant_id`),
+  KEY `idx_financial_daily_summary_date` (`summary_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 CREATE TABLE `saas_orders` (
   `id` bigint(20) NOT NULL AUTO_INCREMENT,
   `tg_user_id` bigint(20) NOT NULL,
@@ -178,7 +206,8 @@ CREATE TABLE `saas_orders` (
   `status` varchar(32) DEFAULT 'PENDING',
   `created_at` datetime DEFAULT current_timestamp(),
   PRIMARY KEY (`id`),
-  KEY `idx_saas_status_price` (`status`,`price`)
+  KEY `idx_saas_status_price` (`status`,`price`),
+  KEY `idx_saas_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `tron_api_nodes` (

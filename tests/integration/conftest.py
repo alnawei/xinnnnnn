@@ -6,7 +6,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from models import Base, EnergyOrder, MicroDepositOrder, ProcessedTx, SaaSOrder, Tenant, User
+from models import Base, EnergyOrder, FinancialDailySummary, MicroDepositOrder, ProcessedTx, SaaSOrder, Tenant, User, WithdrawOrder
 
 
 @pytest.fixture(scope="session")
@@ -36,7 +36,7 @@ async def test_engine(test_database_url):
 async def db_session(test_engine):
     Session = async_sessionmaker(test_engine, expire_on_commit=False)
     async with Session() as session:
-        for model in [ProcessedTx, EnergyOrder, MicroDepositOrder, SaaSOrder, User, Tenant]:
+        for model in [FinancialDailySummary, ProcessedTx, EnergyOrder, MicroDepositOrder, SaaSOrder, WithdrawOrder, User, Tenant]:
             await session.execute(delete(model))
         await session.commit()
         yield session

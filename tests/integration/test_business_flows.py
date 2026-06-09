@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from business_flow_utils import (
     apply_micro_deposit,
@@ -11,11 +12,12 @@ from business_flow_utils import (
     mark_energy_order_manual_review,
     refund_processing_energy_order,
 )
-from models import EnergyOrder, MicroDepositOrder, SaaSOrder, Tenant, User
+from models import EnergyOrder, FinancialDailySummary, MicroDepositOrder, SaaSOrder, Tenant, User, WithdrawOrder
 from services.cleanup_task import (
     expire_and_prune_stale_orders,
     finalize_stale_special_orders,
     purge_processed_tx_history,
+    rollup_and_prune_financial_details,
 )
 
 
@@ -295,7 +297,7 @@ async def test_special_processing_order_times_out_and_refunds_tenant(db_session)
 
 
 @pytest.mark.asyncio
-async def test_cleanup_deletes_old_processed_txs_after_thirty_days(db_session):
+async def test_cleanup_deletes_old_processed_txs_after_ten_days(db_session):
     from models import ProcessedTx
 
     old_tx = ProcessedTx(tx_hash="old-hash", created_at=datetime.utcnow() - timedelta(days=11))
@@ -309,3 +311,106 @@ async def test_cleanup_deletes_old_processed_txs_after_thirty_days(db_session):
     assert deleted == 1
     assert await db_session.get(ProcessedTx, "old-hash") is None
     assert await db_session.get(ProcessedTx, "fresh-hash") is not None
+
+
+@pytest.mark.asyncio
+async def test_financial_details_roll_up_to_daily_summary_then_delete(db_session):
+    tenant, user = await create_tenant_user(db_session)
+    old_time = datetime.utcnow() - timedelta(days=11)
+    old_day = old_time.date()
+
+    deposit = MicroDepositOrder(
+        tenant_id=tenant.id,
+        user_id=user.id,
+        base_amount=10,
+        fractional_amount=Decimal("0.125"),
+        expected_amount=Decimal("10.125"),
+        status="SUCCESS",
+        created_at=old_time,
+        expired_at=old_time,
+    )
+    energy = EnergyOrder(
+        tenant_id=tenant.id,
+        user_id=user.id,
+        order_type="BALANCE_65K",
+        target_address="T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
+        admin_base_cost=Decimal("2.0"),
+        tenant_markup=Decimal("1.0"),
+        total_user_deducted=Decimal("3.0"),
+        status="SUCCESS",
+        created_at=old_time,
+    )
+    withdraw = WithdrawOrder(
+        tenant_id=tenant.id,
+        amount=Decimal("4.0"),
+        target_address="T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
+        status="PAID",
+        created_at=old_time,
+        handled_at=old_time,
+    )
+    saas = SaaSOrder(
+        tg_user_id=tenant.owner_tg_id,
+        order_type="special",
+        days="30",
+        price=Decimal("9.90"),
+        status="PAID",
+        created_at=old_time,
+    )
+    db_session.add_all([deposit, energy, withdraw, saas])
+    await db_session.commit()
+
+    stats = await rollup_and_prune_financial_details(db_session, now=datetime.utcnow())
+    await db_session.commit()
+
+    summary = await db_session.scalar(
+        select(FinancialDailySummary).where(
+            FinancialDailySummary.summary_date == old_day,
+            FinancialDailySummary.tenant_id == tenant.id,
+        )
+    )
+    platform_summary = await db_session.scalar(
+        select(FinancialDailySummary).where(
+            FinancialDailySummary.summary_date == old_day,
+            FinancialDailySummary.tenant_id == 0,
+        )
+    )
+
+    assert stats["summary_days"] >= 1
+    assert summary.deposit_success_count == 1
+    assert summary.deposit_trx == Decimal("10.125000")
+    assert summary.energy_success_count == 1
+    assert summary.energy_user_paid_trx == Decimal("3.000000")
+    assert summary.tenant_profit_trx == Decimal("1.000000")
+    assert summary.withdraw_paid_count == 1
+    assert summary.withdraw_paid_trx == Decimal("4.000000")
+    assert platform_summary.saas_paid_count == 1
+    assert platform_summary.saas_paid_usdt == Decimal("9.900000")
+    assert await db_session.get(MicroDepositOrder, deposit.id) is None
+    assert await db_session.get(EnergyOrder, energy.id) is None
+    assert await db_session.get(WithdrawOrder, withdraw.id) is None
+    assert await db_session.get(SaaSOrder, saas.id) is None
+
+
+@pytest.mark.asyncio
+async def test_financial_daily_summary_is_deleted_after_one_month(db_session):
+    old_summary = FinancialDailySummary(
+        summary_date=(datetime.utcnow() - timedelta(days=40)).date(),
+        tenant_id=1,
+        deposit_success_count=1,
+        deposit_trx=Decimal("10"),
+    )
+    fresh_summary = FinancialDailySummary(
+        summary_date=(datetime.utcnow() - timedelta(days=20)).date(),
+        tenant_id=1,
+        deposit_success_count=1,
+        deposit_trx=Decimal("5"),
+    )
+    db_session.add_all([old_summary, fresh_summary])
+    await db_session.commit()
+
+    stats = await rollup_and_prune_financial_details(db_session, now=datetime.utcnow())
+    await db_session.commit()
+
+    assert stats["summary_deleted"] == 1
+    assert await db_session.get(FinancialDailySummary, old_summary.id) is None
+    assert await db_session.get(FinancialDailySummary, fresh_summary.id) is not None
