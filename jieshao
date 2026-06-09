@@ -1,0 +1,63 @@
+运行代码
+这些是“纯净代码”，也就是项目真正跑业务会用到的：
+main.py
+项目启动入口。启动母机器人、扫块引擎、定时任务、子机器人挂载。
+
+models.py
+数据库模型定义。所有表结构在 Python 里的映射都在这里。
+
+tron_scanner.py
+扫 TRX / USDT 入账，做充值核销、SaaS 付款核销、特价直转发货、游标推进。
+
+netts_api.py
+调用上游 Netts API，发能量、查价格、查余额。
+
+tron_utils.py
+TRON 地址校验工具。检查地址是不是合法 Base58Check 地址。
+
+accounting_utils.py
+账务小工具。负责退款金额回滚、人工确认成功入利润这些纯账务动作。
+
+business_flow_utils.py
+业务状态流转工具。把“充值到账”“SaaS 付款变 PAID”“订单进 MANUAL_REVIEW”“退款”等流程抽成可复用函数。
+
+routers/user.py
+C 端散客路由。余额充值、下单买能量、地址管理、克隆机器人购买入口。
+
+routers/tenant.py
+租户/代理后台。设置 Token、设置提现地址、设置特价地址、代理本金充值、续费。
+
+routers/admin.py
+超管后台。全局配置、套餐配置、调账、提现审核、人工确认 MANUAL_REVIEW 订单。
+
+services/cleanup_task.py
+过期订单清理任务。现在是标记 EXPIRED，不再直接删流水。
+
+db_cleanup.py
+清理老的 processed_txs 防重放记录，属于运维脚本，但也是可执行代码。
+
+测试代码
+这些只在跑测试时用：
+tests/conftest.py
+测试公共配置。给测试准备导入路径和假的环境变量。
+
+tests/test_tron_utils.py
+单元测试：测 TRON 地址校验。
+
+tests/test_netts_api.py
+单元测试：测上游成功、失败、503、超时分类。
+
+tests/test_accounting_utils.py
+单元测试：测退款回滚、人工确认成功记利润。
+
+tests/integration/conftest.py
+集成测试夹具。连接专用测试库、建表、清表。
+
+tests/integration/test_business_flows.py
+集成测试：测真实数据库状态流转。
+
+pytest.ini
+pytest 配置，约束 asyncio 测试行为。
+
+requirements-dev.txt
+测试依赖，不是运行依赖。
