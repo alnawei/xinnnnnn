@@ -158,6 +158,10 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
                 logging.error(f"❌ [发货回执] 致命异常：找不到订单 #{order_id}，无法更新状态或退款！")
                 return
 
+            if order.status != 'PROCESSING':
+                logging.info(f"ℹ️ [发货回执] 订单 #{order_id} 当前状态为 {order.status}，跳过迟到回执，避免重复记账。")
+                return
+
             if success:
                 order.status = 'SUCCESS'
                 await session.commit()
@@ -194,6 +198,10 @@ async def dispatch_global_special_energy(target_address: str, amount: int, order
             )
             if not order:
                 logging.error(f"❌ [全局直营回执] 找不到订单 #{order_id}，无法更新状态。")
+                return
+
+            if order.status != 'PROCESSING':
+                logging.info(f"ℹ️ [全局直营回执] 订单 #{order_id} 当前状态为 {order.status}，跳过迟到回执。")
                 return
 
             order.status = 'SUCCESS' if success else 'FAILED_SILENT'
@@ -590,10 +598,12 @@ async def run_scanner(bot, session_maker):
                             continue
                         
                         logging.info(f"🔍 [追踪-USDT] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}")
-                        
+                        valid_saas_time = datetime.utcnow() - timedelta(minutes=10)
+
                         saas_stmt = select(SaaSOrder).where(
                             SaaSOrder.status == "PENDING", 
-                            SaaSOrder.price == actual_usdt
+                            SaaSOrder.price == actual_usdt,
+                            SaaSOrder.created_at >= valid_saas_time
                         ).order_by(SaaSOrder.created_at.asc()).with_for_update()
                         
                         matched_saas_list = (await session.execute(saas_stmt)).scalars().all()

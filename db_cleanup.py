@@ -13,7 +13,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-PROCESSED_TX_RETENTION_DAYS = 180
+PROCESSED_TX_RETENTION_DAYS = 10
 BATCH_SIZE = 1000
 
 

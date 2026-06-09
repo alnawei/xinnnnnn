@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -12,6 +12,11 @@ from business_flow_utils import (
     refund_processing_energy_order,
 )
 from models import EnergyOrder, MicroDepositOrder, SaaSOrder, Tenant, User
+from services.cleanup_task import (
+    expire_and_prune_stale_orders,
+    finalize_stale_special_orders,
+    purge_processed_tx_history,
+)
 
 
 async def create_tenant_user(session, tenant_id=1, owner_tg_id=1001, user_tg_id=2002):
@@ -210,3 +215,97 @@ async def test_manual_review_success_books_profit(db_session):
 
     assert updated.status == "SUCCESS"
     assert tenant.profit_balance == Decimal("1.500000")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_expired_pending_orders_after_ten_minutes(db_session):
+    old_time = datetime.utcnow() - timedelta(minutes=11)
+    micro_order = MicroDepositOrder(
+        tenant_id=1,
+        user_id=1,
+        base_amount=10,
+        fractional_amount=Decimal("0.125"),
+        expected_amount=Decimal("10.125"),
+        status="PENDING",
+        created_at=old_time,
+        expired_at=old_time,
+    )
+    saas_order = SaaSOrder(
+        tg_user_id=1001,
+        order_type="clone",
+        days="30",
+        price=Decimal("29.90"),
+        status="PENDING",
+        created_at=old_time,
+    )
+    db_session.add_all([micro_order, saas_order])
+    await db_session.commit()
+
+    stats = await expire_and_prune_stale_orders(db_session, now=datetime.utcnow())
+    await db_session.commit()
+
+    assert stats["micro_deleted"] == 1
+    assert stats["saas_deleted"] == 1
+    assert await db_session.get(MicroDepositOrder, micro_order.id) is None
+    assert await db_session.get(SaaSOrder, saas_order.id) is None
+
+
+@pytest.mark.asyncio
+async def test_saas_payment_ignores_order_older_than_ten_minutes(db_session):
+    order = SaaSOrder(
+        tg_user_id=1001,
+        order_type="clone",
+        days="30",
+        price=Decimal("29.90"),
+        status="PENDING",
+        created_at=datetime.utcnow() - timedelta(minutes=11),
+    )
+    db_session.add(order)
+    await db_session.commit()
+
+    matched = await apply_saas_payment(db_session, "tx-saas-expired", Decimal("29.90"))
+    await db_session.commit()
+
+    assert matched is None
+    assert order.status == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_special_processing_order_times_out_and_refunds_tenant(db_session):
+    tenant, _user = await create_tenant_user(db_session)
+    tenant.deposit_balance = Decimal("5")
+    stale_order = EnergyOrder(
+        tenant_id=tenant.id,
+        order_type="DIRECT_SPECIAL_65K",
+        target_address="T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
+        admin_base_cost=Decimal("2.5"),
+        total_user_deducted=Decimal("3.0"),
+        status="PROCESSING",
+        created_at=datetime.utcnow() - timedelta(seconds=90),
+    )
+    db_session.add(stale_order)
+    await db_session.commit()
+
+    closed = await finalize_stale_special_orders(db_session, now=datetime.utcnow())
+    await db_session.commit()
+
+    assert closed == 1
+    assert stale_order.status == "FAILED_REFUNDED"
+    assert tenant.deposit_balance == Decimal("7.500000")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_old_processed_txs_after_thirty_days(db_session):
+    from models import ProcessedTx
+
+    old_tx = ProcessedTx(tx_hash="old-hash", created_at=datetime.utcnow() - timedelta(days=11))
+    fresh_tx = ProcessedTx(tx_hash="fresh-hash", created_at=datetime.utcnow() - timedelta(days=5))
+    db_session.add_all([old_tx, fresh_tx])
+    await db_session.commit()
+
+    deleted = await purge_processed_tx_history(db_session, now=datetime.utcnow())
+    await db_session.commit()
+
+    assert deleted == 1
+    assert await db_session.get(ProcessedTx, "old-hash") is None
+    assert await db_session.get(ProcessedTx, "fresh-hash") is not None
