@@ -94,9 +94,14 @@ class AuthMiddleware(BaseMiddleware):
                     return 
 
                 current_tenant = bot_tenant_owner
-                
-                # ... [保留原有的 current_user 散客建档逻辑与鉴权逻辑] ...
-                
+
+                # 先查询当前租户下是否已有该散客，避免每次消息都重复建档。
+                user_stmt = select(User).where(
+                    User.tenant_id == bot_tenant_owner.id,
+                    User.tg_user_id == user_id
+                )
+                current_user = await session.scalar(user_stmt)
+
                 if not current_user:
                     try:
                         current_user = User(
@@ -109,11 +114,10 @@ class AuthMiddleware(BaseMiddleware):
                         )
                         session.add(current_user)
                         await session.commit()
+                        await session.refresh(current_user)
                     except IntegrityError:
-                        # 🛡️ 防御 2 (并发防撞击气囊)：捕获唯一键冲突
-                        # 说明在极短的毫秒内，其他并发的协程已经帮该用户建好档案了
+                        # 并发时可能另一个协程刚刚建好同一个用户；回滚后重新查询即可。
                         await session.rollback()
-                        # 安全回滚后，直接再查一次，平滑拿到最新数据，绝不崩溃！
                         current_user = await session.scalar(user_stmt)
                     
                 # 🛡️ 防御 3：严格身份鉴定 (强类型字符串比对)
