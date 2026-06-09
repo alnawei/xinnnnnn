@@ -1,6 +1,6 @@
 # models.py
 from datetime import datetime
-from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, Date, DateTime, Enum, ForeignKey, Text
+from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, Date, DateTime, Enum, ForeignKey, Text, UniqueConstraint
 from config import DATABASE_URL
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -104,6 +104,9 @@ class Tenant(Base):
 # ==================== 5. C端消费者表 ====================
 class User(Base):
     __tablename__ = 'users'
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'tg_user_id', name='uq_users_tenant_tg_user'),
+    )
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, ForeignKey('tenants.id', ondelete='CASCADE'), nullable=False)
     tg_user_id = Column(BigInteger, nullable=False)
@@ -177,6 +180,9 @@ class ProcessedTx(Base):
 # ==================== 11. 财务日报汇总表 ====================
 class FinancialDailySummary(Base):
     __tablename__ = 'financial_daily_summaries'
+    __table_args__ = (
+        UniqueConstraint('summary_date', 'tenant_id', name='uq_financial_daily_summary_date_tenant'),
+    )
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     summary_date = Column(Date, nullable=False)
     tenant_id = Column(Integer, nullable=False, default=0)
