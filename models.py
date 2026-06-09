@@ -1,6 +1,6 @@
 # models.py
 from datetime import datetime
-from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, DateTime, Enum, ForeignKey, Text
+from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, Date, DateTime, Enum, ForeignKey, Text
 from config import DATABASE_URL
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -172,9 +172,34 @@ class ProcessedTx(Base):
     __tablename__ = 'processed_txs'
     tx_hash = Column(String(64), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    
 
-# ==================== 11. 代理激活码表 ====================
+
+# ==================== 11. 财务日报汇总表 ====================
+class FinancialDailySummary(Base):
+    __tablename__ = 'financial_daily_summaries'
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    summary_date = Column(Date, nullable=False)
+    tenant_id = Column(Integer, nullable=False, default=0)
+    deposit_success_count = Column(Integer, default=0)
+    deposit_trx = Column(Numeric(18, 6), default=0)
+    energy_success_count = Column(Integer, default=0)
+    energy_refund_count = Column(Integer, default=0)
+    energy_failed_count = Column(Integer, default=0)
+    energy_user_paid_trx = Column(Numeric(18, 6), default=0)
+    energy_refund_trx = Column(Numeric(18, 6), default=0)
+    admin_cost_trx = Column(Numeric(18, 6), default=0)
+    tenant_profit_trx = Column(Numeric(18, 6), default=0)
+    withdraw_paid_count = Column(Integer, default=0)
+    withdraw_paid_trx = Column(Numeric(18, 6), default=0)
+    withdraw_rejected_count = Column(Integer, default=0)
+    withdraw_rejected_trx = Column(Numeric(18, 6), default=0)
+    saas_paid_count = Column(Integer, default=0)
+    saas_paid_usdt = Column(Numeric(18, 6), default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ==================== 12. 代理激活码表 ====================
 class ActivationCode(Base):
     __tablename__ = 'activation_codes'
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -186,7 +211,7 @@ class ActivationCode(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     used_at = Column(DateTime, nullable=True)
     
-# ==================== 12. SaaS 订阅开通订单表 ====================
+# ==================== 13. SaaS 订阅开通订单表 ====================
 class SaaSOrder(Base):
     __tablename__ = 'saas_orders'
     id = Column(BigInteger, primary_key=True, autoincrement=True)
