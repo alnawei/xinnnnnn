@@ -9,8 +9,8 @@ from sqlalchemy.orm import declarative_base
 # 🛡️ SRE 加固：扩容高并发连接池，开启 pool_pre_ping 防断联假死
 engine = create_async_engine(
     DATABASE_URL, 
-    pool_size=100,             # 常驻基础连接数扩容至 100
-    max_overflow=200,          # 流量洪峰时最大允许 200 个溢出连接
+    pool_size=10,             # 常驻基础连接数扩容至 100
+    max_overflow=20,          # 流量洪峰时最大允许 200 个溢出连接
     pool_timeout=30,           # 获取连接的最高等待时间
     pool_pre_ping=True,        # 每次使用前 Ping 一下 MySQL，断线自动重连！
     pool_recycle=1800,         # 连接存活期缩短至半小时，防服务端强制断开
