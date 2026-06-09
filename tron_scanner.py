@@ -26,6 +26,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # 🛡️ 官方 USDT (TRC20) 智能合约地址，绝对防假币！
 USDT_CONTRACT_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+TRX_PRECISION = Decimal("0.000001")
+
+
+def as_trx_decimal(value) -> Decimal:
+    return Decimal(str(value or 0)).quantize(TRX_PRECISION)
 
 
 # ==================== 1. 独立工具库 ====================
@@ -393,17 +398,17 @@ async def run_scanner(bot, session_maker):
                                 )).scalar_one_or_none()
                                 
                                 if tenant and tenant.is_active and not tenant.is_banned:
-                                    float_actual = float(actual_trx_amount)
-                                    float_65k = float(tenant.special_price_65k or 0)
-                                    float_131k = float(tenant.special_price_131k or 0)
+                                    exact_actual = as_trx_decimal(actual_trx_amount)
+                                    price_65k = as_trx_decimal(tenant.special_price_65k)
+                                    price_131k = as_trx_decimal(tenant.special_price_131k)
                                     
                                     order_type = None
                                     energy_amount = 0
                                     
-                                    if float_65k > 0 and float_actual == float_65k:
+                                    if price_65k > 0 and exact_actual == price_65k:
                                         order_type = 'DIRECT_SPECIAL_65K'
                                         energy_amount = 65000
-                                    elif float_131k > 0 and float_actual == float_131k:
+                                    elif price_131k > 0 and exact_actual == price_131k:
                                         order_type = 'DIRECT_SPECIAL_131K'
                                         energy_amount = 131000
                                         
@@ -441,15 +446,15 @@ async def run_scanner(bot, session_maker):
 
                             # 🔀 分流 3：全局超管兜底特价直转 
                             elif sys_config.global_special_address and current_addr == str(sys_config.global_special_address).strip():
-                                float_actual = float(actual_trx_amount)
-                                float_65k = float(sys_config.special_base_cost_65k or 0)
-                                float_131k = float(sys_config.special_base_cost_131k or 0)
+                                exact_actual = as_trx_decimal(actual_trx_amount)
+                                price_65k = as_trx_decimal(sys_config.special_base_cost_65k)
+                                price_131k = as_trx_decimal(sys_config.special_base_cost_131k)
                                 
                                 energy_amount = 0
                                 
-                                if float_65k > 0 and float_actual == float_65k:
+                                if price_65k > 0 and exact_actual == price_65k:
                                     energy_amount = 65000
-                                elif float_131k > 0 and float_actual == float_131k:
+                                elif price_131k > 0 and exact_actual == price_131k:
                                     energy_amount = 131000
                                     
                                 if energy_amount > 0:
@@ -520,38 +525,47 @@ async def run_scanner(bot, session_maker):
                         if matched_saas_list:
                             matched_saas = matched_saas_list[0]
                             matched_saas.status = "PAID"
-                            
-                            # 💡 核心：发放下级代理商权限
-                                                        # 💡 核心：发放下级代理商权限 (强制字符串匹配版)
+
+                            try:
+                                paid_days = int(str(matched_saas.days))
+                            except (TypeError, ValueError):
+                                logging.error(f"❌ [Scanner] SaaS 订单 #{matched_saas.id} days 非法: {matched_saas.days}")
+                                await session.rollback()
+                                continue
+
                             if matched_saas.order_type == "clone":
-                                # 强制将用户 ID 转换为字符串，杜绝数据库类型错位
-                                str_tg_id = str(matched_saas.tg_user_id)
-                                
-                                tenant_check = await session.execute(select(Tenant).where(Tenant.owner_tg_id == str_tg_id).with_for_update())
+                                logging.info(
+                                    f"🎉 [授权到账] 用户 {matched_saas.tg_user_id} 已付款 {paid_days} 天克隆授权，等待提交 Bot Token 激活。"
+                                )
+                            elif matched_saas.order_type == "special":
+                                tenant_check = await session.execute(
+                                    select(Tenant).where(Tenant.owner_tg_id == matched_saas.tg_user_id).with_for_update()
+                                )
                                 existing_tenant = tenant_check.scalar_one_or_none()
-                                
+
                                 if not existing_tenant:
-                                    new_tenant = Tenant(
-                                        owner_tg_id=str_tg_id,  # 存入字符串
-                                        is_active=True,
-                                        expire_time=datetime.utcnow() + timedelta(days=matched_saas.days)
-                                    )
-                                    session.add(new_tenant)
-                                    logging.info(f"🎉 [授权下发] 为用户 {str_tg_id} 创建了全新的 SaaS 代理账户！")
+                                    logging.error(f"❌ [Scanner] 用户 {matched_saas.tg_user_id} 没有租户，无法发放特价插件权限。")
+                                    await session.rollback()
+                                    continue
+
+                                now = datetime.utcnow()
+                                existing_tenant.has_special_energy_right = True
+                                existing_tenant.is_active = True
+                                if existing_tenant.expire_time and existing_tenant.expire_time > now:
+                                    existing_tenant.expire_time += timedelta(days=paid_days)
                                 else:
-                                    existing_tenant.is_active = True
-                                    if getattr(existing_tenant, 'expire_time', None):
-                                        if existing_tenant.expire_time > datetime.utcnow():
-                                            existing_tenant.expire_time += timedelta(days=matched_saas.days)
-                                        else:
-                                            existing_tenant.expire_time = datetime.utcnow() + timedelta(days=matched_saas.days)
-                                    logging.info(f"🎉 [授权下发] 为老用户 {str_tg_id} 完成 {matched_saas.days} 天套餐续费！")
+                                    existing_tenant.expire_time = now + timedelta(days=paid_days)
+                                logging.info(f"🎉 [授权下发] 已为租户 #{existing_tenant.id} 开通/续费特价插件 {paid_days} 天。")
                             
                             await session.merge(ProcessedTx(tx_hash=tx_hash))
                             try:
                                 await session.commit()
                                 pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
-                                success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻重新发送 /start 唤出您的专属代理商主菜单！</b>"
+                                if matched_saas.order_type == "clone":
+                                    next_step = "🚀 <b>下一步：请发送“🤖 克隆机器人”，提交 BotFather Token 完成开通。</b>"
+                                else:
+                                    next_step = "🚀 <b>下一步：请重新发送 /start 刷新代理商主菜单。</b>"
+                                success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n{next_step}"
                                 try: await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
                                 except Exception: pass
                             except Exception as db_err: 

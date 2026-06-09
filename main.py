@@ -127,7 +127,7 @@ async def main():
         await master_bot.session.close()
         
         # 2. 优雅关闭所有子机器人及其轮询任务 (严格的 4 空格对齐)
-        for tenant_id, (sub_bot, sub_task) in bot_manager._running_bots.items():
+        for tenant_id, (sub_bot, sub_task, _sub_dp) in bot_manager._running_bots.items():
             await sub_bot.session.close()
             if sub_task:
                 sub_task.cancel()
