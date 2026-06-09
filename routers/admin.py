@@ -15,6 +15,21 @@ from aiogram.filters import CommandObject
 from filters.role import RoleFilter
 from keyboards.reply import build_admin_keyboard
 from models import WithdrawOrder, Tenant, User, EnergyOrder, MicroDepositOrder, SystemConfig, ActivationCode, TronApiNode, SaaSOrder
+from tron_utils import is_valid_tron_address
+from accounting_utils import mark_manual_review_success, mark_order_refunded, refund_user_balance
+
+MONEY_2 = Decimal("0.01")
+
+
+def parse_money_2(raw: str) -> Decimal:
+    value = Decimal(raw.strip()).quantize(MONEY_2)
+    if value < 0:
+        raise ValueError
+    return value
+
+
+def json_money(value: Decimal) -> str:
+    return format(value, "f")
 
 # ==================== 0. 工具函数：金额格式化 ====================
 def format_amount(amount):
@@ -234,6 +249,7 @@ async def admin_menu_finance(message: Message, session: AsyncSession, state: FSM
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏳ 待处理提现审核", callback_data="admin_fin_pending_wd")],
+        [InlineKeyboardButton(text="🧾 发货人工确认", callback_data="admin_fin_manual_review")],
         [InlineKeyboardButton(text="🏆 租户余额排行榜(分页)", callback_data="admin_fin_tenant_ranks")],
         [InlineKeyboardButton(text="📉 设置最低提现门槛(TRX)", callback_data="admin_set_min_withdraw")],
         [InlineKeyboardButton(text="✍️ 手工资金调账", callback_data="admin_manual_adjust_balance")]  # 👈 新增按钮
@@ -416,10 +432,8 @@ async def edit_package_finish(message: Message, state: FSMContext, session: Asyn
         return await render_clone_packages_panel(message, session)
         
     try:
-        new_price = float(message.text.strip())
-        if new_price < 0:
-            raise ValueError
-    except ValueError:
+        new_price = parse_money_2(message.text)
+    except Exception:
         # 拦截：拦截失败继续留在当前状态
         return await message.answer("❌ 格式错误！金额必须是有效的大于等于 0 的数字，请重新输入：")
         
@@ -429,7 +443,7 @@ async def edit_package_finish(message: Message, state: FSMContext, session: Asyn
         
         config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
         data = get_clone_fee_dict(getattr(config, 'clone_fee_config', '{}'))
-        data[day_to_edit] = new_price
+        data[day_to_edit] = json_money(new_price)
         
         await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(clone_fee_config=json.dumps(data)))
         await session.commit()
@@ -467,10 +481,8 @@ async def add_package_finish(message: Message, state: FSMContext, session: Async
         return await render_clone_packages_panel(message, session)
         
     try:
-        new_price = float(message.text.strip())
-        if new_price < 0:
-            raise ValueError
-    except ValueError:
+        new_price = parse_money_2(message.text)
+    except Exception:
         # 拦截：拦截失败继续留在当前状态
         return await message.answer("❌ 格式错误！金额必须是有效的大于等于 0 的数字，请重新输入：")
         
@@ -480,7 +492,7 @@ async def add_package_finish(message: Message, state: FSMContext, session: Async
         
         config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
         data = get_clone_fee_dict(getattr(config, 'clone_fee_config', '{}'))
-        data[new_pkg_day] = new_price
+        data[new_pkg_day] = json_money(new_price)
         
         await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(clone_fee_config=json.dumps(data)))
         await session.commit()
@@ -586,10 +598,8 @@ async def edit_spec_package_finish(message: Message, state: FSMContext, session:
         return await render_spec_packages_panel(message, session)
         
     try:
-        new_price = float(message.text.strip())
-        if new_price < 0:
-            raise ValueError
-    except ValueError:
+        new_price = parse_money_2(message.text)
+    except Exception:
         return await message.answer("❌ 格式错误！金额必须是有效的大于等于 0 的数字，请重新输入：")
         
     try:
@@ -598,7 +608,7 @@ async def edit_spec_package_finish(message: Message, state: FSMContext, session:
         
         config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
         data = get_spec_auth_dict(getattr(config, 'special_auth_config', '{}'))
-        data[day_to_edit] = new_price
+        data[day_to_edit] = json_money(new_price)
         
         await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(special_auth_config=json.dumps(data)))
         await session.commit()
@@ -636,10 +646,8 @@ async def add_spec_package_finish(message: Message, state: FSMContext, session: 
         return await message.answer("✅ 操作已取消。")
         
     try:
-        new_price = float(message.text.strip())
-        if new_price < 0:
-            raise ValueError
-    except ValueError:
+        new_price = parse_money_2(message.text)
+    except Exception:
         return await message.answer("❌ 格式错误！金额必须是有效的大于等于 0 的数字，请重新输入：")
         
     try:
@@ -648,7 +656,7 @@ async def add_spec_package_finish(message: Message, state: FSMContext, session: 
         
         config = await session.scalar(select(SystemConfig).where(SystemConfig.id == 1))
         data = get_spec_auth_dict(getattr(config, 'special_auth_config', '{}'))
-        data[new_spec_day] = new_price
+        data[new_spec_day] = json_money(new_price)
         
         await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(special_auth_config=json.dumps(data)))
         await session.commit()
@@ -747,17 +755,16 @@ async def process_netts_alert(message: Message, state: FSMContext, session: Asyn
         return await message.answer("✅ 已取消预警配置。")
 
     try:
-        val = float(message.text.strip())
-        if val < 0: raise ValueError
-    except ValueError:
+        val = parse_money_2(message.text)
+    except Exception:
         return await message.answer("❌ 输入错误！请输入一个有效的正数（如 50 或 100.5）：")
 
     try:
         config = (await session.execute(select(SystemConfig).where(SystemConfig.id == 1))).scalar_one_or_none()
         if config:
-            config.netts_alert_threshold = Decimal(str(val))
+            config.netts_alert_threshold = val
             await session.commit()
-            await message.answer(f"✅ <b>修改成功！</b> Netts 预警阈值已更新为 <code>{val}</code> TRX。", parse_mode="HTML")
+            await message.answer(f"✅ <b>修改成功！</b> Netts 预警阈值已更新为 <code>{format_amount(val)}</code> TRX。", parse_mode="HTML")
         await state.clear()
     except Exception as e:
         await session.rollback()
@@ -784,17 +791,16 @@ async def process_tenant_alert(message: Message, state: FSMContext, session: Asy
         return await message.answer("✅ 已取消预警配置。")
 
     try:
-        val = float(message.text.strip())
-        if val < 0: raise ValueError
-    except ValueError:
+        val = parse_money_2(message.text)
+    except Exception:
         return await message.answer("❌ 输入错误！请输入一个有效的正数（如 15 或 20.5）：")
 
     try:
         config = (await session.execute(select(SystemConfig).where(SystemConfig.id == 1))).scalar_one_or_none()
         if config:
-            config.tenant_alert_threshold = Decimal(str(val))
+            config.tenant_alert_threshold = val
             await session.commit()
-            await message.answer(f"✅ <b>修改成功！</b> 特价租户预警阈值已更新为 <code>{val}</code> TRX。", parse_mode="HTML")
+            await message.answer(f"✅ <b>修改成功！</b> 特价租户预警阈值已更新为 <code>{format_amount(val)}</code> TRX。", parse_mode="HTML")
         await state.clear()
     except Exception as e:
         await session.rollback()
@@ -962,7 +968,7 @@ async def trigger_set_special_address(call: CallbackQuery, state: FSMContext):
 @admin_router.message(AdminConfigFSM.wait_special_address)
 async def save_special_address(message: Message, state: FSMContext, session: AsyncSession):
     addr = message.text.strip()
-    if not addr.startswith("T") or len(addr) != 34:
+    if not is_valid_tron_address(addr):
         return await message.answer("❌ 地址格式不正确！必须是以大写 T 开头的 34 位波场地址。")
     await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(global_special_address=addr))
     await session.commit()
@@ -979,7 +985,7 @@ async def trigger_set_master_wallet(call: CallbackQuery, state: FSMContext):
 @admin_router.message(AdminConfigFSM.wait_master_wallet)
 async def save_master_wallet(message: Message, state: FSMContext, session: AsyncSession):
     addr = message.text.strip()
-    if not addr.startswith("T") or len(addr) != 34:
+    if not is_valid_tron_address(addr):
         return await message.answer("❌ 地址格式不正确！必须是以大写 T 开头的 34 位波场地址。")
     await session.execute(update(SystemConfig).where(SystemConfig.id == 1).values(master_receive_address=addr))
     await session.commit()
@@ -1419,6 +1425,123 @@ async def handle_withdraw_action(call: CallbackQuery, session: AsyncSession):
         await session.rollback()
         await call.answer(f"❌ 数据库执行事务错误: {str(e)}", show_alert=True)
     
+
+# ----------------- 🧾 发货人工确认大厅 -----------------
+@admin_router.callback_query(F.data == "admin_fin_manual_review")
+async def fetch_manual_review_orders(call: CallbackQuery, session: AsyncSession):
+    stmt = (
+        select(EnergyOrder)
+        .where(EnergyOrder.status == 'MANUAL_REVIEW')
+        .order_by(EnergyOrder.created_at.asc())
+        .limit(5)
+    )
+    orders = (await session.scalars(stmt)).all()
+
+    if not orders:
+        return await call.answer("当前没有需要人工确认的发货订单。", show_alert=True)
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    for order in orders:
+        text = (
+            "🧾 <b>发货人工确认</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🔖 <b>订单 ID</b>：<code>{order.id}</code>\n"
+            f"🏦 <b>租户 ID</b>：<code>{order.tenant_id}</code>\n"
+            f"👤 <b>用户 ID</b>：<code>{order.user_id or '无'}</code>\n"
+            f"📦 <b>订单类型</b>：<code>{order.order_type}</code>\n"
+            f"💰 <b>扣款金额</b>：<b>{format_amount(order.total_user_deducted)} TRX</b>\n"
+            f"📥 <b>目标地址</b>：\n<code>{order.target_address}</code>\n"
+            f"📅 <b>创建时间</b>：{order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else '未知'}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "请先到 Netts/链上核对真实发货结果，再选择处理动作。"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ 确认已成功", callback_data=f"admin_energy_review:success:{order.id}")],
+            [InlineKeyboardButton(text="❌ 确认失败并退款", callback_data=f"admin_energy_review:refund:{order.id}")]
+        ])
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    await call.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admin_energy_review:"))
+async def handle_energy_review_action(call: CallbackQuery, session: AsyncSession):
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        return await call.answer("参数错误。", show_alert=True)
+
+    action = parts[1]
+    order_id = int(parts[2])
+
+    order = await session.scalar(
+        select(EnergyOrder).where(EnergyOrder.id == order_id).with_for_update()
+    )
+    if not order:
+        return await call.answer("找不到该订单。", show_alert=True)
+
+    if order.status != 'MANUAL_REVIEW':
+        return await call.answer(f"该订单已被处理，当前状态：{order.status}", show_alert=True)
+
+    try:
+        if action == "success":
+            tenant = None
+            if order.tenant_markup and order.tenant_markup > 0:
+                tenant = await session.scalar(
+                    select(Tenant).where(Tenant.id == order.tenant_id).with_for_update()
+                )
+            mark_manual_review_success(order, tenant)
+            await session.commit()
+            await call.message.edit_text(
+                f"✅ <b>订单 #{order.id} 已确认成功。</b>\n状态已更新为 <code>SUCCESS</code>。",
+                parse_mode="HTML"
+            )
+            await call.answer("已确认成功。")
+            return
+
+        if action == "refund":
+            if not order.user_id:
+                return await call.answer("该订单没有用户 ID，无法自动退款，请手工处理。", show_alert=True)
+
+            user = await session.scalar(
+                select(User).where(User.id == order.user_id).with_for_update()
+            )
+            if not user:
+                return await call.answer("找不到用户记录，无法自动退款。", show_alert=True)
+
+            refund_amount = mark_order_refunded(order)
+            refund_user_balance(user, refund_amount)
+            await session.commit()
+
+            await call.message.edit_text(
+                f"❌ <b>订单 #{order.id} 已确认失败并退款。</b>\n"
+                f"💰 已退回：<b>{format_amount(refund_amount)} TRX</b>",
+                parse_mode="HTML"
+            )
+            try:
+                await call.bot.send_message(
+                    chat_id=user.tg_user_id,
+                    text=(
+                        "⚠️ <b>订单人工核对完成</b>\n\n"
+                        f"您的能量订单 #{order.id} 已确认发货失败，"
+                        f"<code>{format_amount(refund_amount)}</code> TRX 已退回余额。"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+            await call.answer("已退款。")
+            return
+
+        await call.answer("未知操作。", show_alert=True)
+    except Exception as e:
+        await session.rollback()
+        await call.answer(f"处理失败，已回滚：{str(e)}", show_alert=True)
+
 # =====================================================================
 # ==================== 5. 封禁、调账与底层成本动态调节 ====================
 # =====================================================================

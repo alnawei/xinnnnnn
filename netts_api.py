@@ -114,7 +114,7 @@ async def delegate_energy(target_address: str, amount: int, duration: str = "1h"
                     try:
                         data = json.loads(raw_text)
                     except:
-                        return {"success": False, "msg": "上游返回非JSON格式"}
+                        return {"success": False, "msg": "上游返回非JSON格式", "uncertain": True}
                         
                     detail_data = data.get("detail", data)
                     if detail_data.get("code") in [0, 10000] or detail_data.get("success") is True or detail_data.get("status") == "success":
@@ -123,13 +123,20 @@ async def delegate_energy(target_address: str, amount: int, duration: str = "1h"
                     else:
                         error_msg = detail_data.get("msg") or detail_data.get("message") or "未知上游拦截"
                         logging.warning(f"[Netts API] C端直购被拒: {error_msg}")
-                        return {"success": False, "msg": f"上游拦截: {error_msg}"}
+                        return {"success": False, "msg": f"上游拦截: {error_msg}", "uncertain": False}
                 else:
-                    return {"success": False, "msg": f"上游接口 HTTP 状态码异常: {resp.status}"}
+                    uncertain = resp.status in [408, 429, 500, 502, 503, 504]
+                    return {"success": False, "msg": f"上游接口 HTTP 状态码异常: {resp.status}", "uncertain": uncertain}
                     
+    except asyncio.TimeoutError:
+        logging.error("❌ [Netts API] 能量派发请求超时，结果未知，需人工核对。")
+        return {"success": False, "msg": "上游请求超时，发货结果未知", "uncertain": True}
+    except aiohttp.ClientError as ce:
+        logging.error(f"❌ [Netts API] 能量派发连接异常，结果未知: {ce}")
+        return {"success": False, "msg": f"上游连接异常，发货结果未知: {str(ce)}", "uncertain": True}
     except Exception as e:
         logging.error(f"❌ [Netts API] 能量派发请求发生异常: {e}")
-        return {"success": False, "msg": f"网络请求超时或异常: {str(e)}"}
+        return {"success": False, "msg": f"网络请求异常: {str(e)}", "uncertain": True}
 
 
 async def get_balance() -> float:

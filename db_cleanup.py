@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 # 导入项目中现成的异步引擎和会话池、以及防重放模型
 from models import engine, AsyncSessionLocal, ProcessedTx
@@ -13,31 +13,42 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+PROCESSED_TX_RETENTION_DAYS = 180
+BATCH_SIZE = 1000
+
+
 async def cleanup_historical_txs():
-    """独立运维任务：物理抹除 15 天前的历史防双花哈希记录"""
+    """独立运维任务：分批抹除超出保留期的防重放哈希记录"""
     logging.info("🧹 [运维清理] 正在连接数据库，准备执行防重放历史数据清理...")
     
     try:
         async with AsyncSessionLocal() as session:
-            # 计算 15 天前的时间阈值
-            threshold_time = datetime.utcnow() - timedelta(days=15)
+            threshold_time = datetime.utcnow() - timedelta(days=PROCESSED_TX_RETENTION_DAYS)
             
             logging.info(f"🔍 [运维清理] 正在检索 created_at < {threshold_time.strftime('%Y-%m-%d %H:%M:%S')} (UTC) 的记录...")
-            
-            # 构建批量物理删除 SQL
-            stmt = delete(ProcessedTx).where(ProcessedTx.created_at < threshold_time)
-            
-            # 执行删除
-            result = await session.execute(stmt)
-            
-            # 必须 commit 才会真实落盘生效
-            await session.commit()
-            
-            deleted_count = result.rowcount
+
+            deleted_count = 0
+            while True:
+                ids_stmt = (
+                    select(ProcessedTx.tx_hash)
+                    .where(ProcessedTx.created_at < threshold_time)
+                    .limit(BATCH_SIZE)
+                )
+                stale_hashes = (await session.execute(ids_stmt)).scalars().all()
+                if not stale_hashes:
+                    break
+
+                result = await session.execute(
+                    delete(ProcessedTx).where(ProcessedTx.tx_hash.in_(stale_hashes))
+                )
+                await session.commit()
+                deleted_count += result.rowcount or 0
+                await asyncio.sleep(0.1)
+
             if deleted_count > 0:
-                logging.info(f"✅ [运维清理] 瘦身成功！物理删除了 {deleted_count} 条 15 天前的历史交易记录。")
+                logging.info(f"✅ [运维清理] 瘦身成功！物理删除了 {deleted_count} 条 {PROCESSED_TX_RETENTION_DAYS} 天前的历史交易记录。")
             else:
-                logging.info("✨ [运维清理] 数据库很干净，没有需要清理的 15 天前历史记录。")
+                logging.info(f"✨ [运维清理] 数据库很干净，没有需要清理的 {PROCESSED_TX_RETENTION_DAYS} 天前历史记录。")
                 
     except Exception as e:
         logging.error(f"❌ [运维清理] 数据库清理任务发生严重异常: {e}", exc_info=True)

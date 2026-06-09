@@ -16,7 +16,7 @@ from config import MASTER_BOT_TOKEN
 from models import (
     AsyncSessionLocal, 
     ProcessedTx, MicroDepositOrder, SaaSOrder,
-    SystemConfig, User, Tenant, TronApiNode, EnergyOrder
+    SystemConfig, User, Tenant, TronApiNode, EnergyOrder, BlockScanPointer
 )
 
 # 导入真实发货接口 (底层已支持动态 duration 分流 URL)
@@ -31,6 +31,51 @@ TRX_PRECISION = Decimal("0.000001")
 
 def as_trx_decimal(value) -> Decimal:
     return Decimal(str(value or 0)).quantize(TRX_PRECISION)
+
+
+def pointer_name(asset_type: str, address: str) -> str:
+    digest = hashlib.sha1(address.encode("utf-8")).hexdigest()[:24]
+    return f"{asset_type.lower()}:{digest}"
+
+
+async def get_scan_pointer(session: AsyncSession, asset_type: str, address: str, fallback_ts: int) -> int:
+    cached = GLOBAL_CURSOR_TRX if asset_type == "TRX" else GLOBAL_CURSOR_USDT
+    if address in cached:
+        return cached[address]
+
+    pointer = await session.scalar(
+        select(BlockScanPointer).where(BlockScanPointer.job_name == pointer_name(asset_type, address))
+    )
+    if pointer:
+        cached[address] = int(pointer.last_scanned_block)
+        return cached[address]
+
+    cached[address] = fallback_ts
+    return fallback_ts
+
+
+async def save_scan_pointer(session: AsyncSession, asset_type: str, address: str, timestamp_ms: int) -> None:
+    if timestamp_ms <= 0:
+        return
+
+    cached = GLOBAL_CURSOR_TRX if asset_type == "TRX" else GLOBAL_CURSOR_USDT
+    cached[address] = timestamp_ms
+
+    job_name = pointer_name(asset_type, address)
+    pointer = await session.scalar(
+        select(BlockScanPointer).where(BlockScanPointer.job_name == job_name).with_for_update()
+    )
+    if pointer:
+        pointer.last_scanned_block = timestamp_ms
+        pointer.address = address
+        pointer.asset_type = asset_type
+    else:
+        session.add(BlockScanPointer(
+            job_name=job_name,
+            last_scanned_block=timestamp_ms,
+            address=address,
+            asset_type=asset_type
+        ))
 
 
 # ==================== 1. 独立工具库 ====================
@@ -139,9 +184,36 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
             logging.error(f"❌ [发货回执] 状态流转或退款落盘发生严重异常: {e}", exc_info=True)
 
 
+async def dispatch_global_special_energy(target_address: str, amount: int, order_id: int, session_maker, duration: str = "5m"):
+    success = await fire_netts_silent(target_address, amount, duration)
+
+    async with session_maker() as session:
+        try:
+            order = await session.scalar(
+                select(EnergyOrder).where(EnergyOrder.id == order_id).with_for_update()
+            )
+            if not order:
+                logging.error(f"❌ [全局直营回执] 找不到订单 #{order_id}，无法更新状态。")
+                return
+
+            order.status = 'SUCCESS' if success else 'FAILED_SILENT'
+            await session.commit()
+            logging.info(f"{'✅' if success else '❌'} [全局直营回执] 订单 #{order_id} 状态已更新为 {order.status}。")
+        except Exception as e:
+            await session.rollback()
+            logging.error(f"❌ [全局直营回执] 状态落盘失败: {e}", exc_info=True)
+
+
 # ==================== 3. 动态节点池与链上数据请求 ====================
 
-async def fetch_tron_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
+async def fetch_tron_paginated(
+    address: str,
+    session: AsyncSession,
+    endpoint: str,
+    base_params: dict,
+    min_timestamp: int = None,
+    max_pages: int = 5
+) -> dict:
     stmt = select(TronApiNode).where(TronApiNode.is_active == True)
     nodes = (await session.execute(stmt)).scalars().all()
     
@@ -152,36 +224,58 @@ async def fetch_tron_transactions(address: str, session: AsyncSession, min_times
     else:
         random.shuffle(nodes)
         
-    params = {"limit": "200", "visible": "true"}
+    params = dict(base_params)
+    params["limit"] = "200"
+    params["visible"] = "true"
     if min_timestamp:
         params["min_timestamp"] = str(min_timestamp)
-        
+
     async with aiohttp.ClientSession() as client:
         for node in nodes:
             current_key = node.api_key
             base_url = node.rpc_url.rstrip('/') if node.rpc_url else "https://api.trongrid.io"
-            url = f"{base_url}/v1/accounts/{address}/transactions"
-            
+            url = f"{base_url}/v1/accounts/{address}/{endpoint}"
+
             headers = {"Accept": "application/json"}
             if current_key:
                 headers["TRON-PRO-API-KEY"] = current_key.strip()
-                
+
+            all_rows = []
+            next_fingerprint = None
             try:
-                async with client.get(url, headers=headers, params=params, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if node.id is not None:
-                            node.fail_count = 0
-                            node.last_used_at = datetime.utcnow()
-                            await session.commit()
-                        return data
-                    elif response.status in [429, 502, 503, 504]:
-                        if node.id is not None:
-                            node.fail_count += 1
-                            if node.fail_count >= 10:
-                                node.is_active = False
-                            await session.commit()
-                        continue
+                for _ in range(max_pages):
+                    page_params = dict(params)
+                    if next_fingerprint:
+                        page_params["fingerprint"] = next_fingerprint
+
+                    async with client.get(url, headers=headers, params=page_params, timeout=10) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            all_rows.extend(data.get("data", []))
+                            meta = data.get("meta", {}) or {}
+                            next_fingerprint = meta.get("fingerprint")
+                            if not next_fingerprint:
+                                if node.id is not None:
+                                    node.fail_count = 0
+                                    node.last_used_at = datetime.utcnow()
+                                    await session.commit()
+                                return {"data": all_rows, "success": data.get("success", True), "meta": meta}
+                            continue
+
+                        if response.status in [429, 502, 503, 504]:
+                            if node.id is not None:
+                                node.fail_count += 1
+                                if node.fail_count >= 10:
+                                    node.is_active = False
+                                await session.commit()
+                            break
+
+                if all_rows:
+                    if node.id is not None:
+                        node.fail_count = 0
+                        node.last_used_at = datetime.utcnow()
+                        await session.commit()
+                    return {"data": all_rows, "success": True, "meta": {"truncated": bool(next_fingerprint)}}
             except Exception:
                 if node.id is not None:
                     node.fail_count += 1
@@ -191,60 +285,28 @@ async def fetch_tron_transactions(address: str, session: AsyncSession, min_times
                 continue
     return {"data": [], "success": False}
 
+
+async def fetch_tron_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
+    return await fetch_tron_paginated(
+        address=address,
+        session=session,
+        endpoint="transactions",
+        base_params={},
+        min_timestamp=min_timestamp
+    )
+
+
 async def fetch_usdt_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
-    stmt = select(TronApiNode).where(TronApiNode.is_active == True)
-    nodes = (await session.execute(stmt)).scalars().all()
-    
-    if not nodes:
-        class DummyNode:
-            id, api_key, rpc_url = None, None, "https://api.trongrid.io"
-        nodes = [DummyNode()]
-    else:
-        random.shuffle(nodes)
-        
-    params = {
-        "limit": "200",
+    return await fetch_tron_paginated(
+        address=address,
+        session=session,
+        endpoint="transactions/trc20",
+        base_params={
         "contract_address": USDT_CONTRACT_ADDRESS,
-        "only_to": "true",
-        "visible": "true"
-    }
-    if min_timestamp:
-        params["min_timestamp"] = str(min_timestamp)
-        
-    async with aiohttp.ClientSession() as client:
-        for node in nodes:
-            current_key = node.api_key
-            base_url = node.rpc_url.rstrip('/') if node.rpc_url else "https://api.trongrid.io"
-            url = f"{base_url}/v1/accounts/{address}/transactions/trc20"
-            
-            headers = {"Accept": "application/json"}
-            if current_key:
-                headers["TRON-PRO-API-KEY"] = current_key.strip()
-                
-            try:
-                async with client.get(url, headers=headers, params=params, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if node.id is not None:
-                            node.fail_count = 0
-                            node.last_used_at = datetime.utcnow()
-                            await session.commit()
-                        return data
-                    elif response.status in [429, 502, 503, 504]:
-                        if node.id is not None:
-                            node.fail_count += 1
-                            if node.fail_count >= 10:
-                                node.is_active = False
-                            await session.commit()
-                        continue
-            except Exception:
-                if node.id is not None:
-                    node.fail_count += 1
-                    if node.fail_count >= 10:
-                        node.is_active = False
-                    await session.commit()
-                continue
-    return {"data": [], "success": False}
+        "only_to": "true"
+        },
+        min_timestamp=min_timestamp
+    )
 
 
 # ==================== 4. 后台全自动扫块主循环 ====================
@@ -295,7 +357,7 @@ async def run_scanner(bot, session_maker):
 
                 # ================= 引擎 A：原生 TRX =================
                 for current_addr in watch_addresses:
-                    current_min_ts_trx = GLOBAL_CURSOR_TRX.get(current_addr, fallback_ts)
+                    current_min_ts_trx = await get_scan_pointer(session, "TRX", current_addr, fallback_ts)
                     trx_response = await fetch_tron_transactions(current_addr, session, current_min_ts_trx)
                     
                     if trx_response and "data" in trx_response:
@@ -453,16 +515,29 @@ async def run_scanner(bot, session_maker):
                                 energy_amount = 0
                                 
                                 if price_65k > 0 and exact_actual == price_65k:
+                                    order_type = 'DIRECT_SPECIAL_65K'
                                     energy_amount = 65000
                                 elif price_131k > 0 and exact_actual == price_131k:
+                                    order_type = 'DIRECT_SPECIAL_131K'
                                     energy_amount = 131000
                                     
                                 if energy_amount > 0:
+                                    new_order = EnergyOrder(
+                                        tenant_id=0,
+                                        order_type=order_type,
+                                        target_address=from_address,
+                                        admin_base_cost=Decimal("0"),
+                                        tenant_markup=actual_trx_amount,
+                                        total_user_deducted=actual_trx_amount,
+                                        status='PROCESSING'
+                                    )
+                                    session.add(new_order)
                                     await session.merge(ProcessedTx(tx_hash=tx_hash))
                                     try:
                                         await session.commit()
+                                        await session.refresh(new_order)
                                         logging.info(f"🎉 [特价派发] 💰 超管直营订单落盘！强制时效: 5m。")
-                                        asyncio.create_task(fire_netts_silent(from_address, energy_amount, "5m"))
+                                        asyncio.create_task(dispatch_global_special_energy(from_address, energy_amount, new_order.id, session_maker, "5m"))
                                     except Exception as e:
                                         await session.rollback()
                                 else:
@@ -471,12 +546,13 @@ async def run_scanner(bot, session_maker):
                                 await session.rollback()
 
                         if max_ts_in_batch > current_min_ts_trx:
-                            GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
+                            await save_scan_pointer(session, "TRX", current_addr, max_ts_in_batch)
+                            await session.commit()
 
                     await asyncio.sleep(0.5)
 
                 # ================= 引擎 B：USDT-TRC20 =================
-                current_min_ts_usdt = GLOBAL_CURSOR_USDT.get(master_addr, fallback_ts)
+                current_min_ts_usdt = await get_scan_pointer(session, "USDT", master_addr, fallback_ts)
                 usdt_response = await fetch_usdt_transactions(master_addr, session, current_min_ts_usdt)
                 
                 if usdt_response and "data" in usdt_response:
@@ -575,7 +651,8 @@ async def run_scanner(bot, session_maker):
                             await session.rollback()
 
                     if max_ts_usdt_batch > current_min_ts_usdt:
-                        GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
+                        await save_scan_pointer(session, "USDT", master_addr, max_ts_usdt_batch)
+                        await session.commit()
 
                 await asyncio.sleep(1)
 

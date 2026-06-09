@@ -27,6 +27,8 @@ CREATE TABLE `activation_codes` (
 CREATE TABLE `block_scan_pointers` (
   `job_name` varchar(64) NOT NULL,
   `last_scanned_block` bigint(20) NOT NULL,
+  `address` varchar(64) DEFAULT NULL,
+  `asset_type` varchar(16) DEFAULT NULL,
   `updated_at` datetime DEFAULT NULL,
   PRIMARY KEY (`job_name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
@@ -151,7 +153,7 @@ CREATE TABLE `energy_orders` (
   `tenant_markup` decimal(18,6) DEFAULT 0.000000,
   `is_unactivated_fee_charged` tinyint(1) DEFAULT 0,
   `total_user_deducted` decimal(18,6) DEFAULT 0.000000,
-  `status` enum('PENDING','SUCCESS','FAILED_REFUNDED','FAILED_SILENT','PROCESSING') NOT NULL DEFAULT 'PENDING' COMMENT '派发状态',
+  `status` enum('PENDING','SUCCESS','FAILED_REFUNDED','FAILED_SILENT','PROCESSING','MANUAL_REVIEW') NOT NULL DEFAULT 'PENDING' COMMENT '派发状态',
   `tx_hash` varchar(64) DEFAULT NULL,
   `created_at` datetime DEFAULT NULL,
   `updated_at` datetime DEFAULT NULL,
@@ -163,7 +165,8 @@ CREATE TABLE `energy_orders` (
 CREATE TABLE `processed_txs` (
   `tx_hash` varchar(64) NOT NULL,
   `created_at` datetime DEFAULT NULL,
-  PRIMARY KEY (`tx_hash`)
+  PRIMARY KEY (`tx_hash`),
+  KEY `idx_processed_txs_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `saas_orders` (

@@ -9,7 +9,7 @@ from aiogram.filters import Command, StateFilter  # 👈 新增 StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import update, select
+from sqlalchemy import update, select, text
 from aiogram.exceptions import TelegramBadRequest
 from filters.role import RoleFilter
 from keyboards.reply import build_tenant_keyboard
@@ -17,6 +17,7 @@ from bot_manager import bot_manager
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from datetime import datetime, timedelta
 from models import Tenant, WithdrawOrder, SystemConfig, ActivationCode, EnergyOrder, SaaSOrder, MicroDepositOrder, User
+from tron_utils import is_valid_tron_address
 
 
 # ==================== 0. 工具函数 ====================
@@ -26,6 +27,15 @@ def format_amount(amount):
         return "0"
     s = f"{float(amount):.2f}"
     return s.rstrip('0').rstrip('.') if '.' in s else s
+
+
+async def acquire_mysql_lock(session: AsyncSession, lock_name: str, timeout: int = 3) -> bool:
+    result = await session.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": timeout})
+    return result.scalar() == 1
+
+
+async def release_mysql_lock(session: AsyncSession, lock_name: str) -> None:
+    await session.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
 
 
 # ==================== 1. 租户管理路由 (给老租户用) ====================
@@ -133,6 +143,10 @@ async def process_tenant_deposit_amount(message: Message, current_tenant: Tenant
 
     await state.clear()
     wait_msg = await message.answer("🔄 正在为您生成高精度安全防伪订单，请稍候...")
+    lock_name = f"micro_deposit_tail:{base_amount}"
+    lock_acquired = await acquire_mysql_lock(session, lock_name)
+    if not lock_acquired:
+        return await wait_msg.edit_text("❌ 当前充值通道繁忙，请稍后重试。")
 
     try:
         # 获取系统配置与主收款地址
@@ -241,6 +255,8 @@ async def process_tenant_deposit_amount(message: Message, current_tenant: Tenant
     except Exception as e:
         await session.rollback()
         await wait_msg.edit_text(f"❌ 专属通道锁定失败，入库异常：{str(e)}")
+    finally:
+        await release_mysql_lock(session, lock_name)
 
 # =========================================================
 # 辅助逻辑：配合上述面板的返回动作
@@ -429,7 +445,7 @@ async def process_set_withdraw_addr(message: Message, current_tenant: Tenant, se
     addr = message.text.strip()
     
     # 防呆 2：基础格式校验
-    if not addr.startswith("T") or len(addr) != 34:
+    if not is_valid_tron_address(addr):
         return await message.answer("❌ 地址格式不正确！必须是以大写 T 开头的 34 位波场地址。请重新输入：")
         
     # 防呆 3：严密的数据库容错，防止静默崩溃石沉大海
@@ -1122,7 +1138,7 @@ async def process_set_special_addr(message: Message, current_tenant: Tenant, ses
         return await message.answer("✅ 操作已取消。")
         
     addr = message.text.strip()
-    if not addr.startswith("T") or len(addr) != 34:
+    if not is_valid_tron_address(addr):
         return await message.answer("❌ 地址格式不正确！必须是以大写 T 开头的 34 位波场地址。请重新输入：")
         
     try:

@@ -20,9 +20,21 @@ from models import SystemConfig, Tenant, User, UserReceiveAddress, MicroDepositO
 # 导入您项目对应的模型与统一的主回复键盘构建器
 from config import SAAS_BOT_URL
 from keyboards.reply import build_user_main_keyboard
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, text
 from tron_scanner import handle_balance_purchase
+from tron_utils import is_valid_tron_address
 import re  # 👈 追加这行：导入正则表达式模块
+
+
+async def acquire_mysql_lock(session: AsyncSession, lock_name: str, timeout: int = 3) -> bool:
+    result = await session.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": timeout})
+    return result.scalar() == 1
+
+
+async def release_mysql_lock(session: AsyncSession, lock_name: str) -> None:
+    await session.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+
+
 # =========================================================
 # 散客充值业务状态机定义
 # =========================================================
@@ -996,6 +1008,25 @@ def get_user_router() -> Router:
                     )
                     await call.message.edit_text(success_msg, parse_mode="HTML")
                 else:
+                    if result.get("uncertain"):
+                        await session.rollback()
+                        locked_order = await session.scalar(
+                            select(EnergyOrder).where(
+                                EnergyOrder.id == new_order.id,
+                                EnergyOrder.status == 'PROCESSING'
+                            ).with_for_update()
+                        )
+                        if locked_order:
+                            locked_order.status = 'MANUAL_REVIEW'
+                            await session.commit()
+                        await call.message.edit_text(
+                            "⚠️ <b>订单进入人工确认</b>\n\n"
+                            f"原因：{result.get('msg', '上游返回不确定')}\n\n"
+                            "为避免上游已发货但系统误退款，资金暂时冻结在本订单中。请联系平台客服核对，确认失败后再退款。",
+                            parse_mode="HTML"
+                        )
+                        return
+
                     # 如果上游明确返回失败，抛出异常交由下方的退款中心处理
                     raise Exception(result["msg"])
                     
@@ -1123,7 +1154,7 @@ def get_user_router() -> Router:
         address = message.text.strip()
         
         # 基础格式校验
-        if not address.startswith("T") or len(address) != 34:
+        if not is_valid_tron_address(address):
             await message.answer(
                 "❌ <b>地址格式不正确！</b>\n波场 TRC20 地址必须以 <b>T</b> 开头且为 34 位字符。\n"
                 "请重新输入，或发送 /cancel 取消：",
@@ -1417,101 +1448,91 @@ def get_user_router() -> Router:
     # 5. 核心核算：生成带有唯一尾数的充值订单（防撞库、自动精度降级与多租户隔离）
     async def generate_tail_order(message: Message, tg_user, base_amount: int, current_tenant, session: AsyncSession):
         """核心机制：生成带微小尾数的充值订单"""
-        
-        # 1. 动态读取全局系统配置
-        config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
-        system_config = (await session.execute(config_stmt)).scalar_one_or_none()
-        if not system_config or not system_config.master_receive_address:
-            await message.edit_text("❌ 系统暂未配置全局收款地址，请联系管理员。")
+        lock_name = f"micro_deposit_tail:{base_amount}"
+        lock_acquired = await acquire_mysql_lock(session, lock_name)
+        if not lock_acquired:
+            await message.edit_text("❌ 当前充值通道繁忙，请稍后重试。")
             return
-        master_address = system_config.master_receive_address
 
-        # 订单生命周期窗口：当前时间 + 10分钟
-        now_time = datetime.utcnow()
-        expire_time = now_time + timedelta(minutes=10)
-        
-        fractional_val = None
-        expected_amount = None
-        is_three_digits = False
-        
-        # === 阶段一：全局排重尝试分配 2 位小数尾数 (.01 - .99) ===
-        for _ in range(40):
-            tail_int = random.randint(1, 99)
-            tail_str = f"0.{tail_int:02d}"
-            test_fractional = Decimal(tail_str)
-            test_expected = Decimal(str(base_amount)) + test_fractional
-            
-            # 扫块核销按金额全局匹配，因此这里也必须全局排重，避免跨租户串单。
-            stmt = select(MicroDepositOrder).where(
-                MicroDepositOrder.expected_amount == test_expected,
-                MicroDepositOrder.status == "PENDING",
-                MicroDepositOrder.expired_at > now_time
-            )
-            existing = (await session.execute(stmt)).scalar_one_or_none()
-            
-            if not existing:
-                fractional_val = test_fractional
-                expected_amount = test_expected
-                break
+        try:
+            config_stmt = select(SystemConfig).where(SystemConfig.id == 1)
+            system_config = (await session.execute(config_stmt)).scalar_one_or_none()
+            if not system_config or not system_config.master_receive_address:
+                await message.edit_text("❌ 系统暂未配置全局收款地址，请联系管理员。")
+                return
+            master_address = system_config.master_receive_address
 
-        # === 阶段二：2位爆满，自动无缝升级至 3 位小数尾数 (.001 - .999) ===
-        if not fractional_val:
-            is_three_digits = True
-            for _ in range(50):
-                tail_int = random.randint(1, 999)
-                if tail_int % 10 == 0: 
-                    continue
-                
-                tail_str = f"0.{tail_int:03d}"
-                test_fractional = Decimal(tail_str)
+            now_time = datetime.utcnow()
+            expire_time = now_time + timedelta(minutes=10)
+            fractional_val = None
+            expected_amount = None
+            is_three_digits = False
+
+            for _ in range(40):
+                tail_int = random.randint(1, 99)
+                test_fractional = Decimal(f"0.{tail_int:02d}")
                 test_expected = Decimal(str(base_amount)) + test_fractional
-                
                 stmt = select(MicroDepositOrder).where(
                     MicroDepositOrder.expected_amount == test_expected,
                     MicroDepositOrder.status == "PENDING",
                     MicroDepositOrder.expired_at > now_time
                 )
                 existing = (await session.execute(stmt)).scalar_one_or_none()
-                
                 if not existing:
                     fractional_val = test_fractional
                     expected_amount = test_expected
                     break
 
-        if not fractional_val:
-            await message.edit_text("❌ 当前充值通道极其繁忙，请稍后或更换金额重试。")
-            return
+            if not fractional_val:
+                is_three_digits = True
+                for _ in range(50):
+                    tail_int = random.randint(1, 999)
+                    if tail_int % 10 == 0:
+                        continue
+                    test_fractional = Decimal(f"0.{tail_int:03d}")
+                    test_expected = Decimal(str(base_amount)) + test_fractional
+                    stmt = select(MicroDepositOrder).where(
+                        MicroDepositOrder.expected_amount == test_expected,
+                        MicroDepositOrder.status == "PENDING",
+                        MicroDepositOrder.expired_at > now_time
+                    )
+                    existing = (await session.execute(stmt)).scalar_one_or_none()
+                    if not existing:
+                        fractional_val = test_fractional
+                        expected_amount = test_expected
+                        break
 
-        try:
-            # 💡【防记错账校正】查询对应租户下 C端 User 数据库物理自增主键 ID，以供 tron_scanner.py 扫块精准核销
-            user_record = await session.scalar(
-                select(User).where(User.tenant_id == current_tenant.id, User.tg_user_id == tg_user.id)
-            )
-            if not user_record:
-                await message.edit_text("❌ 获取用户信息失败，无法锁定专属充值通道。")
+            if not fractional_val:
+                await message.edit_text("❌ 当前充值通道极其繁忙，请稍后或更换金额重试。")
                 return
 
-            # 3. 完美映射数据库字段并保存
-            new_order = MicroDepositOrder(
-                tenant_id=current_tenant.id,         # 写入租户 ID，确保 SQLite NOT NULL 约束通过
-                user_id=user_record.id,              # 写入 user.id (并非 tg_user.id)，保证扫块精准上分
-                base_amount=Decimal(str(base_amount)),
-                fractional_amount=fractional_val,
-                expected_amount=expected_amount,
-                status="PENDING",
-                expired_at=expire_time
-            )
-            session.add(new_order)
-            await session.commit()
-            
-        except Exception as db_err:
-            await session.rollback()
-            await message.edit_text(f"❌ 专属通道锁定失败，入库异常：{str(db_err)}")
-            return
+            try:
+                user_record = await session.scalar(
+                    select(User).where(User.tenant_id == current_tenant.id, User.tg_user_id == tg_user.id)
+                )
+                if not user_record:
+                    await message.edit_text("❌ 获取用户信息失败，无法锁定专属充值通道。")
+                    return
 
-        # 4. 精确格式化输出
+                new_order = MicroDepositOrder(
+                    tenant_id=current_tenant.id,
+                    user_id=user_record.id,
+                    base_amount=Decimal(str(base_amount)),
+                    fractional_amount=fractional_val,
+                    expected_amount=expected_amount,
+                    status="PENDING",
+                    expired_at=expire_time
+                )
+                session.add(new_order)
+                await session.commit()
+            except Exception as db_err:
+                await session.rollback()
+                await message.edit_text(f"❌ 专属通道锁定失败，入库异常：{str(db_err)}")
+                return
+        finally:
+            await release_mysql_lock(session, lock_name)
+
         amount_display = f"{expected_amount:.2f}" if not is_three_digits else f"{expected_amount:.3f}"
-        
         invoice_text = (
             "✅ <b>专属充值订单已生成！</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"

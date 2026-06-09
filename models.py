@@ -73,6 +73,8 @@ class BlockScanPointer(Base):
     __tablename__ = 'block_scan_pointers'
     job_name = Column(String(64), primary_key=True)
     last_scanned_block = Column(BigInteger, nullable=False)
+    address = Column(String(64))
+    asset_type = Column(String(16))
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ==================== 4. 核心租户表 ====================
@@ -160,7 +162,7 @@ class EnergyOrder(Base):
     tenant_markup = Column(Numeric(18, 6), default=0)
     is_unactivated_fee_charged = Column(Boolean, default=False)
     total_user_deducted = Column(Numeric(18, 6), default=0)
-    status = Column(Enum('PENDING', 'SUCCESS', 'FAILED_REFUNDED', 'FAILED_SILENT', 'PROCESSING'), default='PENDING')
+    status = Column(Enum('PENDING', 'SUCCESS', 'FAILED_REFUNDED', 'FAILED_SILENT', 'PROCESSING', 'MANUAL_REVIEW'), default='PENDING')
     tx_hash = Column(String(64))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -169,7 +171,7 @@ class EnergyOrder(Base):
 class ProcessedTx(Base):
     __tablename__ = 'processed_txs'
     tx_hash = Column(String(64), primary_key=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     
 
 # ==================== 11. 代理激活码表 ====================
