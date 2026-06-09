@@ -3,7 +3,6 @@
 import asyncio
 import aiohttp
 import logging
-import random
 import hashlib
 import time
 from datetime import datetime, timedelta
@@ -27,6 +26,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # 🛡️ 官方 USDT (TRC20) 智能合约地址，绝对防假币！
 USDT_CONTRACT_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 TRX_PRECISION = Decimal("0.000001")
+
+
+def rotate_nodes_by_hour(nodes: list) -> list:
+    """按小时轮换 Tron API 节点；当前节点失败时，后续循环会继续尝试下一个。"""
+    if len(nodes) <= 1:
+        return nodes
+
+    # 先按数据库 ID 固定顺序排列，避免每次查询顺序变化导致轮换不稳定。
+    sorted_nodes = sorted(nodes, key=lambda node: node.id or 0)
+    current_hour = int(time.time() // 3600)
+    start_index = current_hour % len(sorted_nodes)
+    return sorted_nodes[start_index:] + sorted_nodes[:start_index]
 
 
 def as_trx_decimal(value) -> Decimal:
@@ -230,7 +241,7 @@ async def fetch_tron_paginated(
             id, api_key, rpc_url = None, None, "https://api.trongrid.io"
         nodes = [DummyNode()]
     else:
-        random.shuffle(nodes)
+        nodes = rotate_nodes_by_hour(nodes)
         
     params = dict(base_params)
     params["limit"] = "200"
