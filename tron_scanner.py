@@ -468,7 +468,7 @@ async def run_scanner(bot, session_maker):
                         if max_ts_in_batch > current_min_ts_trx:
                             GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
 
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
 
                 # ================= 引擎 B：USDT-TRC20 =================
                 current_min_ts_usdt = GLOBAL_CURSOR_USDT.get(master_addr, fallback_ts)
@@ -563,12 +563,12 @@ async def run_scanner(bot, session_maker):
                     if max_ts_usdt_batch > current_min_ts_usdt:
                         GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
 
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1)
 
         except Exception as e:
             logging.error(f"❌ [Scanner] 扫块循环发生严重异常: {e}", exc_info=True)
             
-        await asyncio.sleep(6)
+        await asyncio.sleep(3)
 
 
 # ==================== 5. 点火开关 ====================
