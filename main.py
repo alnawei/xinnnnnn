@@ -13,6 +13,7 @@ from cron_jobs import start_scheduler
 from tasks import auto_update_netts_price  # 👈 导入我们刚才写好的守护协程
 from routers.user import get_user_router  
 from services.monitor_task import run_financial_monitor
+from tron_scanner import run_scanner
 # 导入您项目中的数据库会话工厂 (确保名称匹配 models.py)
 from decimal import Decimal
 from models import AsyncSessionLocal, Tenant, SystemConfig
@@ -111,6 +112,7 @@ async def main():
     
     # ⚠️ 点火挂载：全局财务报警雷达 (成功注入 Netts API 模块)
     monitor_task = asyncio.create_task(run_financial_monitor(AsyncSessionLocal, master_bot, netts_api))
+    scanner_task = asyncio.create_task(run_scanner(master_bot, AsyncSessionLocal))
     try:
         # 启动机器人轮询 (非阻塞地与 scanner_task 并发运行)
         await master_dp.start_polling(master_bot)
@@ -118,7 +120,7 @@ async def main():
         logging.info("🧹 正在执行优雅退出...")
         
         # 🛡️ SRE 加固：全面回收所有后台常驻协程，杜绝孤儿任务导致内存溢出
-        for task_name in ['monitor_task', 'price_task']:
+        for task_name in ['monitor_task', 'scanner_task']:
             if task_name in locals() and not locals()[task_name].done():
                 locals()[task_name].cancel()
                 
