@@ -190,24 +190,63 @@ def get_user_router() -> Router:
         price_65k_val = f"{float(price_65k_val_raw):g}"
         price_131k_val = f"{float(price_131k_val_raw):g}"
 
-        # 动态提取特价价格数据进行格式化 (特价部分使用的绝对售价数据)
-        price_65k_special = f"{float(current_tenant.special_price_65k if getattr(current_tenant, 'has_special_energy_right', False) else sys_config.special_base_cost_65k):g}"
-        price_131k_special = f"{float(current_tenant.special_price_131k if getattr(current_tenant, 'has_special_energy_right', False) else sys_config.special_base_cost_131k):g}"
-
         # 1. 动态构建特价费率的树状线条
+                # =====================================================================
+        # 🎯 核心逻辑：特价能量三级向下兜底渲染 (Agent -> Admin -> None)
+        # =====================================================================
+        show_special = False
+        special_address = ""
         special_price_text = ""
-        if show_special:
-            if show_65k and show_131k:
-                special_price_text = (
-                    f"\n├ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{price_65k_special} TRX"
-                    f"\n└ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{price_131k_special} TRX"
-                )
-            elif show_65k:
-                special_price_text = f"\n└ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{price_65k_special} TRX"
-            elif show_131k:
-                special_price_text = f"\n└ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{price_131k_special} TRX"
+        dur_cn = ""
+        
+        # 提前拉取超管配置兜底备用
+        g_65k = float(getattr(sys_config, 'special_base_cost_65k', 0.0) or 0.0)
+        g_131k = float(getattr(sys_config, 'special_base_cost_131k', 0.0) or 0.0)
+        g_addr = sys_config.global_special_address if sys_config else None
 
-        # 2. 拼接 /start 完整欢迎语
+        # 尝试读取代理商自己的配置
+        t_65k = 0.0
+        t_131k = 0.0
+        t_addr = None
+        if current_tenant and getattr(current_tenant, 'has_special_energy_right', False):
+            t_65k = float(getattr(current_tenant, 'special_price_65k', 0.0) or 0.0)
+            t_131k = float(getattr(current_tenant, 'special_price_131k', 0.0) or 0.0)
+            t_addr = current_tenant.special_energy_address
+
+        # 🥇 优先级 1：代理商自营特价 (有特权，且至少设了一个价格，且设置了发货地址)
+        if (t_65k > 0 or t_131k > 0) and t_addr:
+            show_special = True
+            special_address = t_addr
+            dur_val = getattr(current_tenant, "special_energy_duration", "1h")
+            dur_cn = "5分钟" if dur_val == "5m" else "1小时"
+            
+            if t_65k > 0 and t_131k > 0:
+                special_price_text = (
+                    f"\n├ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{t_65k:g} TRX"
+                    f"\n├ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{t_131k:g} TRX"
+                )
+            elif t_65k > 0:
+                special_price_text = f"\n├ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{t_65k:g} TRX"
+            elif t_131k > 0:
+                special_price_text = f"\n├ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{t_131k:g} TRX"
+
+        # 🥈 优先级 2：超管全局兜底 (代理没开特价，或者把价格设为了 0) -> 走平台直营
+        elif (g_65k > 0 or g_131k > 0) and g_addr:
+            show_special = True
+            special_address = g_addr
+            dur_cn = "5分钟"  # 💡 平台直营兜底强制时效 5 分钟，利润最大化
+            
+            if g_65k > 0 and g_131k > 0:
+                special_price_text = (
+                    f"\n├ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{g_65k:g} TRX"
+                    f"\n├ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{g_131k:g} TRX"
+                )
+            elif g_65k > 0:
+                special_price_text = f"\n├ 1️⃣ <b>免费转 1 笔 U (65K)</b>：{g_65k:g} TRX"
+            elif g_131k > 0:
+                special_price_text = f"\n├ 2️⃣ <b>免费转 2 笔 U (131K)</b>：{g_131k:g} TRX"
+
+        # 2. 拼接 /start 完整欢迎语上半部分
         welcome_text = (
             "⚡️ <b>波场全自动能量分销系统</b>\n\n"
             "<b>👤 我的账户</b>\n"
@@ -221,17 +260,18 @@ def get_user_router() -> Router:
             f"└ 🟡 对方无 U：{float(price_131k_val):.2f} TRX / 笔\n\n"
         )
         
-        # 如果开启了特价，则动态追加特价卡片区域
+        # 🥉 优先级 3：动态追加特价卡片区域 (如果 show_special 为 False，直接跳过不显示)
         if show_special and special_address:
             welcome_text += (
                 "<b>💥 特价费率：</b>"
                 f"{special_price_text}\n"
                 "├ 📥 <b>使用教程</b>：转账对应数量的 TRX 到下面地址，3秒后再去转 U 不扣 TRX 手续费！\n"
+                f"├ ⏱ <b>时效说明</b>：能量 <b>{dur_cn}</b> 内有效，到期自动收回。\n"
                 "└ ✅ <b>能量租用地址 (点击自动复制)</b>：\n"
                 f"<code>{special_address}</code>\n"
                 "   <i>(付款后立即生效，秒到不提醒)</i>\n\n"
+                "👇 💡 强烈建议您将此地址<b>【点击复制】</b>并保存至您的收藏夹，随时转账，随时秒到！\n\n"
             )
-
         # 获取用户默认绑定的接收地址 (对应 default_receive_address_id)
         default_address = None
         if current_user and current_user.default_receive_address_id:
