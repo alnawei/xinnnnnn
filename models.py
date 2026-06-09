@@ -1,6 +1,6 @@
 # models.py
 from datetime import datetime
-from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, Date, DateTime, Enum, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, Numeric, Boolean, Date, DateTime, ForeignKey, Text, UniqueConstraint
 from config import DATABASE_URL
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -135,7 +135,7 @@ class MicroDepositOrder(Base):
     base_amount = Column(Integer, nullable=False)
     fractional_amount = Column(Numeric(4, 3), nullable=False)
     expected_amount = Column(Numeric(10, 3), nullable=False)
-    status = Column(Enum('PENDING', 'SUCCESS', 'EXPIRED'), default='PENDING')
+    status = Column(String(32), default='PENDING')
     tx_hash = Column(String(64))
     created_at = Column(DateTime, default=datetime.utcnow)
     expired_at = Column(DateTime, nullable=False)
@@ -147,7 +147,7 @@ class WithdrawOrder(Base):
     tenant_id = Column(Integer, nullable=False)
     amount = Column(Numeric(18, 6), nullable=False)
     target_address = Column(String(34), nullable=False)
-    status = Column(Enum('PENDING', 'PAID', 'REJECTED'), default='PENDING')
+    status = Column(String(32), default='PENDING')
     tx_hash = Column(String(64))
     reject_reason = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -159,13 +159,13 @@ class EnergyOrder(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, nullable=False)
     user_id = Column(BigInteger)
-    order_type = Column(Enum('BALANCE_65K', 'BALANCE_131K', 'DIRECT_SPECIAL', 'DIRECT_SPECIAL_65K', 'DIRECT_SPECIAL_131K'), nullable=False)
+    order_type = Column(String(32), nullable=False)
     target_address = Column(String(34), nullable=False)
     admin_base_cost = Column(Numeric(18, 6), default=0)
     tenant_markup = Column(Numeric(18, 6), default=0)
     is_unactivated_fee_charged = Column(Boolean, default=False)
     total_user_deducted = Column(Numeric(18, 6), default=0)
-    status = Column(Enum('PENDING', 'SUCCESS', 'FAILED_REFUNDED', 'FAILED_SILENT', 'PROCESSING', 'MANUAL_REVIEW'), default='PENDING')
+    status = Column(String(32), default='PENDING')
     tx_hash = Column(String(64))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
