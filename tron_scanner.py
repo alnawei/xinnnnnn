@@ -30,25 +30,15 @@ USDT_CONTRACT_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 # ==================== 1. 独立工具库 ====================
 def hex_to_base58(hex_addr: str) -> str:
-    """
-    原生纯 Python 实现的 Hex 转 Base58Check (波场标准)
-    完全零外部依赖，摆脱环境报错！
-    """
     if not hex_addr or not hex_addr.startswith("41") or len(hex_addr) != 42:
         return hex_addr
         
     try:
-        # 1. 16进制转 bytes
         addr_bytes = bytes.fromhex(hex_addr)
-        
-        # 2. 计算双重 SHA256
         hash1 = hashlib.sha256(addr_bytes).digest()
         hash2 = hashlib.sha256(hash1).digest()
-        
-        # 3. 追加前4字节校验和
         full_payload = addr_bytes + hash2[:4]
         
-        # 4. 原生 Base58 编码数学算法
         ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
         num = int.from_bytes(full_payload, 'big')
         
@@ -62,7 +52,6 @@ def hex_to_base58(hex_addr: str) -> str:
         return hex_addr
         
 async def send_tg_message(user_id: int, text: str):
-    """独立脚本专用的 TG 消息推送器，不依赖 aiogram dispatcher"""
     url = f"https://api.telegram.org/bot{MASTER_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": user_id, "text": text, "parse_mode": "HTML"}
     try:
@@ -71,22 +60,12 @@ async def send_tg_message(user_id: int, text: str):
     except Exception as e:
         logging.error(f"推送TG消息失败: {e}")
 
-# ==================== 2. 外部业务发货接口 (供 user.py / tenant.py 调用) ====================
+# ==================== 2. 外部业务发货接口 ====================
 
-async def handle_balance_purchase(
-    user_id: int, 
-    address: str, 
-    amount_type: str, 
-    cost: Decimal,
-    order_id: int,           
-    tenant_id: int,          
-    tenant_profit: Decimal   
-):
-    """【散户余额购单】强一致性闭环：默认走 1h 发货、改状态、代理分润、失败退款。"""
+async def handle_balance_purchase(user_id: int, address: str, amount_type: str, cost: Decimal, order_id: int, tenant_id: int, tenant_profit: Decimal):
     amount = 65000 if "65K" in amount_type else 131000
 
     async with AsyncSessionLocal() as session:
-        # 💡 散户常规购买，默认不传 duration，底层直接走 1h 接口
         success = await fire_netts_silent(address, amount)
         
         if success:
@@ -106,7 +85,6 @@ async def handle_balance_purchase(
             await session.execute(
                 update(EnergyOrder).where(EnergyOrder.id == order_id).values(status='FAILED_REFUNDED')
             )
-            # 防并发穿仓退款：原路退回 TRX 资金并扣减消费次数
             stmt = update(User).where(User.tg_user_id == user_id).values(
                 balance=User.balance + cost,
                 total_spent_trx=User.total_spent_trx - cost,
@@ -117,19 +95,11 @@ async def handle_balance_purchase(
             await send_tg_message(user_id, "❌ <b>能量派发失败</b>\n\n上游网络波动或库存不足，派发中断。<b>扣除的 TRX 已全额安全退回至您的账户</b>，请稍后重试！")
 
 
-# =====================================================================
-# 辅助核销发货函数：特价静默派发与状态流转（带失败自动退款防线）
-# =====================================================================
 async def dispatch_special_energy(target_address: str, amount: int, order_id: int, session_maker, duration: str = "1h"):
-    """特价能量静默发货引擎：发货、更新订单状态，失败必须退回代理本金！"""
-    
-    # 💡 核心修复：把 duration 透传给底层的 Netts 发货函数
     success = await fire_netts_silent(target_address, amount, duration)
     
-    # 2. 异步另起会话处理财务状态，防止阻塞主循环
     async with session_maker() as session:
         try:
-            # 开启排他锁查询该笔能量订单
             order = (await session.execute(
                 select(EnergyOrder).where(EnergyOrder.id == order_id).with_for_update()
             )).scalar_one_or_none()
@@ -146,13 +116,11 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
                 logging.warning(f"⚠️ [发货回执] 订单 #{order_id} 发货失败，立即启动代理商本金退款程序...")
                 order.status = 'FAILED_REFUNDED'
                 
-                # 获取对应的租户，加排他锁防并发
                 tenant = (await session.execute(
                     select(Tenant).where(Tenant.id == order.tenant_id).with_for_update()
                 )).scalar_one_or_none()
                 
                 if tenant:
-                    # 💡 核心财务修复：将当时扣除的进货底价成本，一分不动地加回代理商的 deposit_balance
                     refund_amount = order.admin_base_cost
                     tenant.deposit_balance = tenant.deposit_balance + refund_amount
                     logging.info(f"✅ [发货回执] 退款成功！已向租户 #{tenant.id} 的进货本金池退回 {refund_amount} TRX。")
@@ -169,7 +137,6 @@ async def dispatch_special_energy(target_address: str, amount: int, order_id: in
 # ==================== 3. 动态节点池与链上数据请求 ====================
 
 async def fetch_tron_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
-    """带节点池轮询、自适应熔断的原生 TRX API 请求引擎 (加装时间滑动窗口)"""
     stmt = select(TronApiNode).where(TronApiNode.is_active == True)
     nodes = (await session.execute(stmt)).scalars().all()
     
@@ -180,11 +147,7 @@ async def fetch_tron_transactions(address: str, session: AsyncSession, min_times
     else:
         random.shuffle(nodes)
         
-    params = {
-        "limit": "200",
-        "visible": "true" 
-    }
-    # 🚨 必须将内存游标传入 API 参数，减少返回的垃圾数据量
+    params = {"limit": "200", "visible": "true"}
     if min_timestamp:
         params["min_timestamp"] = str(min_timestamp)
         
@@ -224,7 +187,6 @@ async def fetch_tron_transactions(address: str, session: AsyncSession, min_times
     return {"data": [], "success": False}
 
 async def fetch_usdt_transactions(address: str, session: AsyncSession, min_timestamp: int = None) -> dict:
-    """带节点池轮询、防假币的 TRC20 (USDT) API 请求引擎 (加装时间滑动窗口)"""
     stmt = select(TronApiNode).where(TronApiNode.is_active == True)
     nodes = (await session.execute(stmt)).scalars().all()
     
@@ -241,7 +203,6 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession, min_times
         "only_to": "true",
         "visible": "true"
     }
-    # 🚨 必须将内存游标传入 API 参数
     if min_timestamp:
         params["min_timestamp"] = str(min_timestamp)
         
@@ -283,12 +244,10 @@ async def fetch_usdt_transactions(address: str, session: AsyncSession, min_times
 
 # ==================== 4. 后台全自动扫块主循环 ====================
 
-# 🧠 SRE 终极防线：将游标字典声明在【全局作用域 (Module Level)】！
 GLOBAL_CURSOR_TRX = {}
 GLOBAL_CURSOR_USDT = {}
 
 async def run_scanner(bot, session_maker):
-    """后台扫块主循环：双轨全局游标阵列轮询、悲观锁防双花"""
     logging.info("🚀 [Scanner] 波场全自动多地址阵列游标扫块引擎已启动...")
     
     loop_count = 0
@@ -296,7 +255,6 @@ async def run_scanner(bot, session_maker):
     while True:
         loop_count += 1
         try:
-            # 动态计算 2 分钟前的兜底时间戳，防止开机扫描远古数据瀑布流
             fallback_ts = int((time.time() - 120) * 1000)
 
             async with session_maker() as session:
@@ -323,17 +281,14 @@ async def run_scanner(bot, session_maker):
                     )
                 )).scalars().all()
                 
-                # 字典里只存整数 ID，隔绝 ORM 懒加载报错
                 tenant_addr_map = {str(t.special_energy_address).strip(): t.id for t in active_tenants if t.special_energy_address}
                 watch_addresses.extend(list(tenant_addr_map.keys()))
-                watch_addresses = list(set(watch_addresses)) # 去重
+                watch_addresses = list(set(watch_addresses))
 
                 if loop_count % 10 == 0:
-                    logging.info(f"💓 [Heartbeat] 阵列雷达平稳运行，共监听 {len(watch_addresses)} 个独立地址 (已轮询 {loop_count} 次)")
+                    pass # 静默心跳
 
-                # ========================================================
-                # 引擎 A：原生 TRX 进账全局滑动监听
-                # ========================================================
+                # ================= 引擎 A：原生 TRX =================
                 for current_addr in watch_addresses:
                     current_min_ts_trx = GLOBAL_CURSOR_TRX.get(current_addr, fallback_ts)
                     trx_response = await fetch_tron_transactions(current_addr, session, current_min_ts_trx)
@@ -358,7 +313,6 @@ async def run_scanner(bot, session_maker):
                                 
                             current_ts_ms = int(time.time() * 1000)
                             if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
-                                logging.warning(f"🚫 [拦截] 订单已超时丢弃 (距今已超60秒)。TXID: {tx_hash}")
                                 continue
 
                             contract = tx.get("raw_data", {}).get("contract", [{}])[0]
@@ -391,9 +345,9 @@ async def run_scanner(bot, session_maker):
                             if actual_trx_amount <= 0:
                                 continue
 
-                            logging.info(f"✅ [初筛通过] 发现有效原生入账: TXID={tx_hash}, 金额={actual_trx_amount} TRX, 准备分流...")
+                            logging.info(f"✅ [初筛通过] 发现有效原生入账: TXID={tx_hash}, 金额={actual_trx_amount} TRX")
 
-                            # 🔀 分流 1：主钱包微小尾数充值盲配
+                            # 🔀 分流 1：主钱包微小尾数充值
                             if current_addr == master_addr:
                                 order_stmt = select(MicroDepositOrder).where(
                                     MicroDepositOrder.expected_amount == actual_trx_amount,
@@ -425,14 +379,13 @@ async def run_scanner(bot, session_maker):
                                             except Exception: pass
                                         except Exception as db_err:
                                             await session.rollback()
-                                            logging.error(f"❌ 充值持久化失败: {db_err}")
                                             continue
                                     else:
                                         await session.rollback()
                                 else:
                                     await session.rollback()
 
-                            # 🔀 分流 2：租户专属特价静默直转 (🔥 核心成本与时效解绑区)
+                            # 🔀 分流 2：租户专属特价静默直转
                             elif current_addr in tenant_addr_map:
                                 target_tenant_id = tenant_addr_map[current_addr]
                                 tenant = (await session.execute(
@@ -456,16 +409,12 @@ async def run_scanner(bot, session_maker):
                                         
                                     if order_type:
                                         await session.refresh(sys_config)
-                                        
-                                        # 💡 核心解绑点：扣除成本依然按照超管后台配置的 1H 成本刚性扣除！绝不降价！
                                         netts_cost = Decimal(str(sys_config.netts_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.netts_cost_131k))
                                         draw_cost = Decimal(str(sys_config.base_cost_65k)) if "65K" in order_type else Decimal(str(sys_config.base_cost_131k))
                                         deduction_cost = netts_cost + draw_cost
                                         
                                         if deduction_cost > 0 and tenant.deposit_balance >= deduction_cost:
                                             tenant.deposit_balance = tenant.deposit_balance - deduction_cost
-                                            
-                                            # 💡 时效读取：获取代理设置的发货时效 (容错默认为 1h)
                                             tenant_dur = getattr(tenant, "special_energy_duration", "1h")
                                             
                                             new_order = EnergyOrder(
@@ -480,20 +429,17 @@ async def run_scanner(bot, session_maker):
                                                 await session.commit()
                                                 await session.refresh(new_order)
                                                 logging.info(f"🎉 [特价派发] 代理本金暗扣成功！已拉起 Netts 发货任务 (时效: {tenant_dur})。")
-                                                # 注入动态时效发送能量
                                                 asyncio.create_task(dispatch_special_energy(from_address, energy_amount, new_order.id, session_maker, duration=tenant_dur))
                                             except Exception as e:
                                                 await session.rollback()
-                                                logging.error(f"❌ 订单生成失败: {e}")
                                         else:
-                                            logging.warning(f"🚫 [拦截] 代理本金不足，拒绝发货。")
                                             await session.rollback()
                                     else:
                                         await session.rollback()
                                 else:
                                     await session.rollback()
 
-                            # 🔀 分流 3：全局超管兜底特价直转 (最高利润率直营盘)
+                            # 🔀 分流 3：全局超管兜底特价直转 
                             elif sys_config.global_special_address and current_addr == str(sys_config.global_special_address).strip():
                                 float_actual = float(actual_trx_amount)
                                 float_65k = float(sys_config.special_base_cost_65k or 0)
@@ -507,32 +453,24 @@ async def run_scanner(bot, session_maker):
                                     energy_amount = 131000
                                     
                                 if energy_amount > 0:
-                                    logging.info(f"✅ [追踪] 盲配成功！命中全局超管特价档位, 能量: {energy_amount}")
                                     await session.merge(ProcessedTx(tx_hash=tx_hash))
                                     try:
                                         await session.commit()
-                                        logging.info(f"🎉 [特价派发] 💰 超管直营订单落盘！已拉起 Netts 发货任务 (强制时效: 5m)。")
-                                        # 💡 核心解绑：直营盘无需走内部扣费清算表，直接调用底层静默 API，强制 5M 利润最大化！
+                                        logging.info(f"🎉 [特价派发] 💰 超管直营订单落盘！强制时效: 5m。")
                                         asyncio.create_task(fire_netts_silent(from_address, energy_amount, "5m"))
                                     except Exception as e:
                                         await session.rollback()
-                                        logging.error(f"❌ 全局特价防双花落盘失败: {e}")
                                 else:
                                     await session.rollback()
-                            
-                            # 🔀 分流 4：未知杂音地址拦截
                             else:
                                 await session.rollback()
 
-                        # 循环结束后：强制更新下一轮请求的游标
                         if max_ts_in_batch > current_min_ts_trx:
                             GLOBAL_CURSOR_TRX[current_addr] = max_ts_in_batch
 
                     await asyncio.sleep(0.3)
 
-                # ========================================================
-                # 引擎 B：USDT-TRC20 进账滑动监听 (仅查主钱包)
-                # ========================================================
+                # ================= 引擎 B：USDT-TRC20 =================
                 current_min_ts_usdt = GLOBAL_CURSOR_USDT.get(master_addr, fallback_ts)
                 usdt_response = await fetch_usdt_transactions(master_addr, session, current_min_ts_usdt)
                 
@@ -556,7 +494,6 @@ async def run_scanner(bot, session_maker):
                             
                         current_ts_ms = int(time.time() * 1000)
                         if block_ts > 0 and (current_ts_ms - block_ts) > 60000:
-                            logging.warning(f"🚫 [拦截] USDT 订单已超时丢弃 (距今已超60秒)！TXID: {tx_hash}")
                             continue
                         
                         if tx.get("to") != master_addr or tx.get("token_info", {}).get("address") != USDT_CONTRACT_ADDRESS: 
@@ -571,7 +508,7 @@ async def run_scanner(bot, session_maker):
                         if actual_usdt <= 0: 
                             continue
                         
-                        logging.info(f"🔍 [追踪-USDT] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}, 类型=USDT, 收款方={master_addr}")
+                        logging.info(f"🔍 [追踪-USDT] 解析到新入账: TXID={tx_hash}, 金额={actual_usdt}")
                         
                         saas_stmt = select(SaaSOrder).where(
                             SaaSOrder.status == "PENDING", 
@@ -584,11 +521,37 @@ async def run_scanner(bot, session_maker):
                             matched_saas = matched_saas_list[0]
                             matched_saas.status = "PAID"
                             
+                            # 💡 核心：发放下级代理商权限
+                                                        # 💡 核心：发放下级代理商权限 (强制字符串匹配版)
+                            if matched_saas.order_type == "clone":
+                                # 强制将用户 ID 转换为字符串，杜绝数据库类型错位
+                                str_tg_id = str(matched_saas.tg_user_id)
+                                
+                                tenant_check = await session.execute(select(Tenant).where(Tenant.owner_tg_id == str_tg_id).with_for_update())
+                                existing_tenant = tenant_check.scalar_one_or_none()
+                                
+                                if not existing_tenant:
+                                    new_tenant = Tenant(
+                                        owner_tg_id=str_tg_id,  # 存入字符串
+                                        is_active=True,
+                                        expire_time=datetime.utcnow() + timedelta(days=matched_saas.days)
+                                    )
+                                    session.add(new_tenant)
+                                    logging.info(f"🎉 [授权下发] 为用户 {str_tg_id} 创建了全新的 SaaS 代理账户！")
+                                else:
+                                    existing_tenant.is_active = True
+                                    if getattr(existing_tenant, 'expire_time', None):
+                                        if existing_tenant.expire_time > datetime.utcnow():
+                                            existing_tenant.expire_time += timedelta(days=matched_saas.days)
+                                        else:
+                                            existing_tenant.expire_time = datetime.utcnow() + timedelta(days=matched_saas.days)
+                                    logging.info(f"🎉 [授权下发] 为老用户 {str_tg_id} 完成 {matched_saas.days} 天套餐续费！")
+                            
                             await session.merge(ProcessedTx(tx_hash=tx_hash))
                             try:
                                 await session.commit()
                                 pkg_name = "独立专属子机器人授权" if matched_saas.order_type == "clone" else "增值功能插件"
-                                success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻前往主菜单点击对应选项，绑定 Token 或开启特权！</b>"
+                                success_text = f"🎉 <b>支付成功，您的授权已到账！</b>\n\n🛍️ <b>开通服务</b>：{pkg_name} ({matched_saas.days}天)\n💵 <b>核销金额</b>：<code>{actual_usdt:g}</code> USDT\n🔗 <b>交易哈希</b>：<code>{tx_hash}</code>\n\n🚀 <b>下一步：请立刻重新发送 /start 唤出您的专属代理商主菜单！</b>"
                                 try: await bot.send_message(chat_id=int(matched_saas.tg_user_id), text=success_text, parse_mode="HTML")
                                 except Exception: pass
                             except Exception as db_err: 
@@ -600,7 +563,6 @@ async def run_scanner(bot, session_maker):
                     if max_ts_usdt_batch > current_min_ts_usdt:
                         GLOBAL_CURSOR_USDT[master_addr] = max_ts_usdt_batch
 
-                # 阵列防封避退：每轮查询之间休眠 0.3 秒
                 await asyncio.sleep(0.3)
 
         except Exception as e:
@@ -609,25 +571,17 @@ async def run_scanner(bot, session_maker):
         await asyncio.sleep(6)
 
 
-# =====================================================================
-# 🚀 独立守护进程点火开关 (Standalone Entry Point)
-# =====================================================================
+# ==================== 5. 点火开关 ====================
 if __name__ == "__main__":
     from aiogram import Bot
     from aiogram.client.default import DefaultBotProperties
     
-    # 从配置文件和模型中引入点火所需的必需品
-    from config import MASTER_BOT_TOKEN
-    from models import AsyncSessionLocal
-    
     async def standalone_main():
         logging.info("🚀 准备点火！波场双轨扫块独立引擎启动中...")
         master_bot = Bot(token=MASTER_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-        
         try:
             await run_scanner(master_bot, AsyncSessionLocal)
         finally:
-            logging.info("🧹 正在释放扫块引擎资源...")
             await master_bot.session.close()
 
     try:
